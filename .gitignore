@@ -77,3 +77,7 @@ run/
 *.zip
 
 components.d.ts
+
+# 本地备份（不提交）
+.git-local-backup/
+

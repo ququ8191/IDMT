@@ -23,7 +23,7 @@
 param(
     [string]$Version,
     [string]$Notes = "Manual release",
-    [string]$Repo = "Perxenic-Acid/SSMT4"
+    [string]$Repo = "ququ8191/IDMT"
 )
 
 Set-StrictMode -Version Latest
@@ -37,6 +37,8 @@ $tauriConfigPath = Join-Path $projectRoot "src-tauri/tauri.conf.json"
 $rawConfig = Get-Content -LiteralPath $tauriConfigPath -Raw
 $cfg = $rawConfig | ConvertFrom-Json
 $hasVersionOverride = -not [string]::IsNullOrEmpty($Version)
+# IDMT 关闭了应用自更新，因此默认只产出安装包，不再生成签名与 latest.json。
+$updaterArtifacts = [bool]$cfg.bundle.createUpdaterArtifacts
 if (-not $hasVersionOverride) {
     $Version = [string]$cfg.version
 }
@@ -48,16 +50,18 @@ $keyDir = Join-Path $HOME ".ssmt"
 $privateKeyPath = Join-Path $keyDir "updater-signing.key"
 $passwordFile = Join-Path $keyDir "updater-signing-key.password"
 
-# ---------- 1. 密钥检查（自动从项目外读取，脚本本身不含任何密钥） ----------
-if (-not (Test-Path -LiteralPath $privateKeyPath)) {
-    throw "未找到更新签名私钥：$privateKeyPath`n请先运行：bunx tauri signer generate -w `"$privateKeyPath`" 生成密钥。"
-}
-if (-not (Test-Path -LiteralPath $passwordFile)) {
-    throw "未找到私钥密码文件：$passwordFile"
-}
+# ---------- 1. 密钥检查（仅在启用应用更新产物时需要；自动从项目外读取，脚本本身不含任何密钥） ----------
+if ($updaterArtifacts) {
+    if (-not (Test-Path -LiteralPath $privateKeyPath)) {
+        throw "未找到更新签名私钥：$privateKeyPath`n请先运行：bunx tauri signer generate -w `"$privateKeyPath`" 生成密钥。"
+    }
+    if (-not (Test-Path -LiteralPath $passwordFile)) {
+        throw "未找到私钥密码文件：$passwordFile"
+    }
 
-$env:TAURI_SIGNING_PRIVATE_KEY_PATH = $privateKeyPath
-$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = (Get-Content -LiteralPath $passwordFile -Raw).Trim()
+    $env:TAURI_SIGNING_PRIVATE_KEY_PATH = $privateKeyPath
+    $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = (Get-Content -LiteralPath $passwordFile -Raw).Trim()
+}
 
 # ---------- 2. 版本号处理 ----------
 if ($hasVersionOverride) {
@@ -111,14 +115,18 @@ catch {
     throw
 }
 
-# ---------- 5. 构建 Tauri（scripts/tauri-with-signing.mjs 会自动完成签名） ----------
-Write-Host "`n[2/4] 开始 Tauri 构建（含更新签名）..." -ForegroundColor Yellow
+# ---------- 5. 构建 Tauri ----------
+Write-Host "`n[2/4] 开始 Tauri 构建 ..." -ForegroundColor Yellow
 bun run tauri build
 if ($LASTEXITCODE -ne 0) { throw "tauri build 失败（退出码 $LASTEXITCODE）" }
 
-# ---------- 6. 生成 latest.json ----------
-Write-Host "`n[3/4] 生成 latest.json ..." -ForegroundColor Yellow
-& (Join-Path $projectRoot "generate-latest-json.ps1") -Repo $Repo -Version $Version -Notes $Notes
+# ---------- 6. 生成 latest.json（仅在启用应用更新产物时） ----------
+if ($updaterArtifacts) {
+    Write-Host "`n[3/4] 生成 latest.json ..." -ForegroundColor Yellow
+    & (Join-Path $projectRoot "generate-latest-json.ps1") -Repo $Repo -Version $Version -Notes $Notes
+} else {
+    Write-Host "`n[3/4] 已关闭应用更新，跳过 latest.json" -ForegroundColor Yellow
+}
 
 # ---------- 7. 收集产物到 publish/ ----------
 Write-Host "`n[4/4] 收集产物到 publish/ ..." -ForegroundColor Yellow
@@ -132,12 +140,13 @@ $exe = Get-ChildItem -LiteralPath $bundleDir -File |
     Select-Object -First 1
 if (-not $exe) { throw "未找到安装包：$bundleDir" }
 
-$sig = "$($exe.FullName).sig"
-if (-not (Test-Path -LiteralPath $sig)) { throw "未找到签名文件：$sig" }
-
 Copy-Item -LiteralPath $exe.FullName -Destination $publishDir -Force
-Copy-Item -LiteralPath $sig -Destination $publishDir -Force
-Copy-Item -LiteralPath (Join-Path $bundleDir "latest.json") -Destination $publishDir -Force
+if ($updaterArtifacts) {
+    $sig = "$($exe.FullName).sig"
+    if (-not (Test-Path -LiteralPath $sig)) { throw "未找到签名文件：$sig" }
+    Copy-Item -LiteralPath $sig -Destination $publishDir -Force
+    Copy-Item -LiteralPath (Join-Path $bundleDir "latest.json") -Destination $publishDir -Force
+}
 
 Write-Host "`n============================================" -ForegroundColor Green
 Write-Host "✅ 打包完成！发布产物在：" -ForegroundColor Green
