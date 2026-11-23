@@ -36,10 +36,6 @@ Blender 侧插件请直接使用上面的上游项目，IDMT 不修改、不重�
 
 安装包见 [Releases](https://github.com/ququ8191/IDMT/releases)。安装包未签名，Windows 可能提示 SmartScreen。
 
-## 社区讨论记录
-
-作者提供的截图，记录了一次与本项目相关的社区讨论：
-
 ![社区讨论记录](docs/media/community-feedback.jpg)
 
 ## 与 SSMT4 并存
