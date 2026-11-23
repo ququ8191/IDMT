@@ -20,14 +20,21 @@ Blender 侧插件请直接使用上面的上游项目，IDMT 不修改、不重�
 
 ## 本分支的改动
 
-- 新增第五人格游戏预设、图标与模型数据类型。
-- 包体来源：`ququ8191/IdentityV-Package` 的 Release ZIP。
+- 新增第五人格游戏预设、图标、默认背景与模型数据类型；首次运行默认勾选第五人格。
+- 包体来源：`ququ8191/IdentityV-Package` 的 Release ZIP，按 `IdentityV-Package-*.zip` 精确匹配资产。
 - 运行时（`d3d11.dll`）唯一来源：`StarBobis/ProjectBunny`，含配套 `d3dcompiler_47.dll`。
+- 修复贴图预览把坐标尺度不同的模型整体判定为异常并叠红的问题（仅对第五人格放宽判定）。
+- 旧版 `source-<提交哈希>` 版本号可正确迁移到正式 Release 并提示更新。
 - 应用标识改为 `com.idmt.app`；配置目录 `IDMTGlobalConfigs`；默认缓存 `IDMTCachedFolder`；可执行文件 `IDMT.exe`。
 - 关闭上游应用自更新通道（包体与运行时更新不受影响），避免把 SSMT4 的更新装进 IDMT。
 - 全局唤醒快捷键改为 `Alt+Shift+F`，避免与并存运行的 SSMT4 冲突。
+- 关于页的发布页、使用文档、反馈入口指向本仓库；界面残留的 SSMT 名称已清理，`SSMT Runtime` 等确指上游运行时的名称保留。
 
-完整改动记录见 [docs/identityv-integration.md](docs/identityv-integration.md)。
+详细接入说明见 [docs/identityv-integration.md](docs/identityv-integration.md)。
+
+## 下载
+
+安装包见 [Releases](https://github.com/ququ8191/IDMT/releases)。安装包未签名，Windows 可能提示 SmartScreen。
 
 ## 与 SSMT4 并存
 
