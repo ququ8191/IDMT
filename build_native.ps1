@@ -1,0 +1,207 @@
+﻿[CmdletBinding()]
+param(
+    [ValidateSet("Debug", "Release")]
+    [string]$Configuration = "Debug",
+
+    [switch]$BuildTestPlugin,
+
+    [bool]$BuildPoserProbe = $true,
+
+    [bool]$BuildGimiBridge = $true,
+
+    [switch]$DeployToTestRuntime,
+
+    [string]$TestRuntimeDir,
+
+    [string]$TestGamePreset = 'GIMI'
+)
+
+$ErrorActionPreference = "Stop"
+
+$RepoRoot = $PSScriptRoot
+$NativeDir = Join-Path $RepoRoot "native"
+$BuildDir = Join-Path $NativeDir "build"
+$DistDir = Join-Path $NativeDir "dist\$Configuration"
+$ResourceDir = Join-Path $RepoRoot "src-tauri\resources"
+if ($DeployToTestRuntime) {
+    . (Join-Path $RepoRoot 'runtime\TestEnvironment.ps1')
+    $TestRuntimeDir = Resolve-TestRuntimeDirectory -TestRuntimeDir $TestRuntimeDir -GamePreset $TestGamePreset
+}
+
+$CargoProfile = if ($Configuration -eq "Release") {
+    "release"
+} else {
+    "debug"
+}
+
+function Invoke-Checked {
+    param(
+        [string]$Command,
+        [string[]]$Arguments
+    )
+
+    Write-Host ">> $Command $($Arguments -join ' ')"
+
+    & $Command @Arguments
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Command failed with exit code $LASTEXITCODE"
+    }
+}
+
+Write-Host ""
+Write-Host "=== Building SSMT Native [$Configuration] ==="
+Write-Host ""
+
+$cargoArgs = @(
+    "build",
+    "--manifest-path", (Join-Path $NativeDir "Cargo.toml"),
+    "-p", "ssmt-plugin-host"
+)
+
+if ($Configuration -eq "Release") {
+    $cargoArgs += "--release"
+}
+
+Invoke-Checked "cargo" $cargoArgs
+
+Invoke-Checked "cmake" @(
+    "-S", $NativeDir,
+    "-B", $BuildDir,
+    "-DSSMT_BUILD_PLAYER_TWEAKS=ON",
+    "-DSSMT_BUILD_POSER_PROBE=$(if ($BuildPoserProbe) { 'ON' } else { 'OFF' })",
+    "-DSSMT_BUILD_GIMI_BRIDGE=$(if ($BuildGimiBridge) { 'ON' } else { 'OFF' })",
+    "-DSSMT_POSER_ARTIFACT_DIR=$DistDir"
+)
+
+Invoke-Checked "cmake" @(
+    "--build", $BuildDir,
+    "--config", $Configuration,
+    "--parallel"
+)
+
+New-Item `
+    -ItemType Directory `
+    -Path $DistDir `
+    -Force `
+    | Out-Null
+
+$PluginHostSource = Join-Path `
+    $NativeDir `
+    "target\$CargoProfile\ssmt_plugin_host.dll"
+
+$PluginHostDist = Join-Path $DistDir "SSMT-PluginHost.dll"
+
+if (-not (Test-Path -LiteralPath $PluginHostSource)) {
+    throw "PluginHost build artifact not found: $PluginHostSource"
+}
+
+Copy-Item `
+    -LiteralPath $PluginHostSource `
+    -Destination $PluginHostDist `
+    -Force
+
+$Artifacts = @(
+    "Run.exe",
+    "SSMT-PluginHost.dll"
+)
+
+foreach ($Name in $Artifacts) {
+    $Path = Join-Path $DistDir $Name
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Native artifact not found: $Path"
+    }
+}
+
+New-Item `
+    -ItemType Directory `
+    -Path $ResourceDir `
+    -Force `
+    | Out-Null
+
+foreach ($Name in $Artifacts) {
+    Copy-Item `
+        -LiteralPath (Join-Path $DistDir $Name) `
+        -Destination (Join-Path $ResourceDir $Name) `
+        -Force
+}
+
+# 开发包放在构建目录，不能被应用资源通配符带入正式安装器。
+$BackendArguments = @{ ArtifactDirectory = $DistDir; PrepareRuntimeComponents = $BuildGimiBridge }
+if ($Configuration -eq 'Release') { $BackendArguments.Release = $true }
+& (Join-Path $NativeDir 'tools\build-plugin-backends.ps1') @BackendArguments
+if (-not $?) { throw '插件后台及页面构建失败' }
+& (Join-Path $NativeDir 'tools\stage-local-plugins.ps1') `
+    -NativeArtifactDirectory $DistDir `
+    -OutputDirectory (Join-Path $RepoRoot 'build/plugin-packages') `
+    -ExcludePluginId @(
+        if (-not $BuildPoserProbe) { 'ssmt.poser.genshin-probe' }
+        if (-not $BuildGimiBridge) { 'ssmt.dlss5.integration' }
+    )
+
+if ($BuildTestPlugin) {
+    $testPluginArgs = @(
+        "build",
+        "--manifest-path", (Join-Path $NativeDir "Cargo.toml"),
+        "-p", "ssmt-test-plugin"
+    )
+
+    if ($Configuration -eq "Release") {
+        $testPluginArgs += "--release"
+    }
+
+    Invoke-Checked "cargo" $testPluginArgs
+
+    $TestPluginSource = Join-Path `
+        $NativeDir `
+        "target\$CargoProfile\ssmt_test_plugin.dll"
+
+    $TestPluginDirectory = Join-Path $NativeDir "Plugins"
+    $TestPluginDestination = Join-Path `
+        $TestPluginDirectory `
+        "ssmt_test_plugin.dll"
+
+    if (-not (Test-Path -LiteralPath $TestPluginSource)) {
+        throw "Test plugin build artifact not found: $TestPluginSource"
+    }
+
+    New-Item `
+        -ItemType Directory `
+        -Path $TestPluginDirectory `
+        -Force `
+        | Out-Null
+
+    Copy-Item `
+        -LiteralPath $TestPluginSource `
+        -Destination $TestPluginDestination `
+        -Force
+
+    Write-Host "Test plugin staged to: $TestPluginDestination"
+}
+
+if ($DeployToTestRuntime) {
+    if (-not (Test-Path -LiteralPath $TestRuntimeDir -PathType Container)) {
+        throw "Test runtime directory does not exist: $TestRuntimeDir"
+    }
+
+    foreach ($Name in $Artifacts) {
+        Copy-Item `
+            -LiteralPath (Join-Path $DistDir $Name) `
+            -Destination (Join-Path $TestRuntimeDir $Name) `
+            -Force
+    }
+
+    Write-Host "Native runtime deployed to: $TestRuntimeDir"
+}
+
+Write-Host ""
+Write-Host "=== Native build complete ==="
+
+foreach ($Name in $Artifacts) {
+    Write-Host "  $Name"
+}
+
+Write-Host ""
+Write-Host "Staged to:"
+Write-Host "  $ResourceDir"

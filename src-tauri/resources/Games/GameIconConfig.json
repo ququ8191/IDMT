@@ -1,0 +1,13 @@
+{
+  "GameIconSettingList": [
+    { "GameName": "WWMI", "Show": true },
+    { "GameName": "GIMI", "Show": true },
+    { "GameName": "SRMI", "Show": true },
+    { "GameName": "HIMI", "Show": true },
+    { "GameName": "ZZMI", "Show": true },
+    { "GameName": "ZZMIDX12", "Show": true },
+    { "GameName": "EFMI", "Show": true },
+    { "GameName": "CAMI", "Show": true },
+    { "GameName": "IdentityV", "Show": true }
+  ]
+}

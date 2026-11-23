@@ -1,0 +1,342 @@
+use super::{ExternalDependency, PluginPermission, SUPPORTED_PLATFORM};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MarketplaceCatalog {
+    pub schema_version: u32,
+    pub entries: Vec<MarketplaceEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MarketplaceEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub author: String,
+    pub version: String,
+    pub download_url: String,
+    pub sha256: String,
+    pub minimum_ssmt_version: String,
+    #[serde(default)]
+    pub maximum_ssmt_version: Option<String>,
+    pub supported_platforms: Vec<String>,
+    #[serde(default)]
+    pub supported_games: Vec<String>,
+    pub package_size: u64,
+    #[serde(default)]
+    pub permissions: Vec<PluginPermission>,
+    #[serde(default)]
+    pub external_dependencies: Vec<ExternalDependency>,
+    /// 展示包内第三方组件的来源与许可；不能仅因它们存在就拒绝插件。
+    #[serde(default)]
+    pub bundled_third_party_payloads: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarketplaceError {
+    UnsupportedSchema(u32),
+    InvalidEntry(String),
+    DuplicateEntry(String),
+    InvalidUrl(String),
+    InvalidHash(String),
+    UnsupportedPlatform(String),
+    HashMismatch { expected: String, actual: String },
+}
+
+impl std::fmt::Display for MarketplaceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedSchema(version) => {
+                write!(formatter, "unsupported marketplace schema: {version}")
+            }
+            Self::InvalidEntry(detail) => write!(formatter, "invalid marketplace entry: {detail}"),
+            Self::DuplicateEntry(id) => write!(formatter, "duplicate marketplace entry: {id}"),
+            Self::InvalidUrl(url) => {
+                write!(formatter, "marketplace download URL must use HTTPS: {url}")
+            }
+            Self::InvalidHash(hash) => write!(formatter, "invalid SHA256: {hash}"),
+            Self::UnsupportedPlatform(platform) => {
+                write!(formatter, "unsupported marketplace platform: {platform}")
+            }
+            Self::HashMismatch { expected, actual } => write!(
+                formatter,
+                "marketplace package SHA256 mismatch: expected {expected}, got {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MarketplaceError {}
+
+pub fn verify_package_sha256(
+    package_path: &Path,
+    expected_sha256: &str,
+) -> Result<(), MarketplaceError> {
+    let expected = expected_sha256.trim().to_ascii_lowercase();
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(MarketplaceError::InvalidHash(expected));
+    }
+    let mut file = File::open(package_path)
+        .map_err(|error| MarketplaceError::InvalidEntry(format!("cannot read package: {error}")))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            MarketplaceError::InvalidEntry(format!("cannot hash package: {error}"))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected {
+        return Err(MarketplaceError::HashMismatch { expected, actual });
+    }
+    Ok(())
+}
+
+impl MarketplaceCatalog {
+    pub fn validate(&self) -> Result<(), MarketplaceError> {
+        if self.schema_version != 1 {
+            return Err(MarketplaceError::UnsupportedSchema(self.schema_version));
+        }
+        let mut ids = HashSet::new();
+        for entry in &self.entries {
+            super::validate_external_dependencies(&entry.external_dependencies)
+                .map_err(|error| MarketplaceError::InvalidEntry(error.to_string()))?;
+            if !ids.insert(format!("{}@{}", entry.id, entry.version)) {
+                return Err(MarketplaceError::DuplicateEntry(format!(
+                    "{}@{}",
+                    entry.id, entry.version
+                )));
+            }
+            if entry.id.trim().is_empty()
+                || entry.name.trim().is_empty()
+                || entry.author.trim().is_empty()
+            {
+                return Err(MarketplaceError::InvalidEntry(
+                    "id, name and author are required".to_string(),
+                ));
+            }
+            semver::Version::parse(&entry.version).map_err(|_| {
+                MarketplaceError::InvalidEntry(format!("invalid version: {}", entry.version))
+            })?;
+            semver::VersionReq::parse(&entry.minimum_ssmt_version.replace(['x', 'X', '*'], "0"))
+                .map_err(|_| {
+                    MarketplaceError::InvalidEntry(format!(
+                        "invalid minimum SSMT version: {}",
+                        entry.minimum_ssmt_version
+                    ))
+                })?;
+            if let Some(maximum) = &entry.maximum_ssmt_version {
+                semver::VersionReq::parse(&format!("<={}", maximum.replace(['x', 'X', '*'], "0")))
+                    .map_err(|_| {
+                        MarketplaceError::InvalidEntry(format!(
+                            "invalid maximum SSMT version: {maximum}"
+                        ))
+                    })?;
+            }
+            let url = reqwest::Url::parse(&entry.download_url)
+                .map_err(|_| MarketplaceError::InvalidUrl(entry.download_url.clone()))?;
+            if url.scheme() != "https" {
+                return Err(MarketplaceError::InvalidUrl(entry.download_url.clone()));
+            }
+            if entry.sha256.len() != 64
+                || !entry.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(MarketplaceError::InvalidHash(entry.sha256.clone()));
+            }
+            if entry.supported_platforms.is_empty() {
+                return Err(MarketplaceError::InvalidEntry(
+                    "supportedPlatforms is empty".to_string(),
+                ));
+            }
+            for platform in &entry.supported_platforms {
+                if platform != SUPPORTED_PLATFORM {
+                    return Err(MarketplaceError::UnsupportedPlatform(platform.clone()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn from_json_str(raw: &str) -> Result<Self, MarketplaceError> {
+        let catalog = serde_json::from_str::<Self>(raw)
+            .map_err(|error| MarketplaceError::InvalidEntry(error.to_string()))?;
+        catalog.validate()?;
+        Ok(catalog)
+    }
+}
+
+impl MarketplaceEntry {
+    pub fn supports(&self, ssmt_version: &str, platform: &str, game: Option<&str>) -> bool {
+        let Ok(version) = semver::Version::parse(ssmt_version) else {
+            return false;
+        };
+        let minimum =
+            semver::VersionReq::parse(&self.minimum_ssmt_version.replace(['x', 'X', '*'], "0"));
+        if minimum.map_or(true, |requirement| !requirement.matches(&version)) {
+            return false;
+        }
+        if let Some(maximum) = &self.maximum_ssmt_version {
+            let Ok(requirement) =
+                semver::VersionReq::parse(&format!("<={}", maximum.replace(['x', 'X', '*'], "0")))
+            else {
+                return false;
+            };
+            if !requirement.matches(&version) {
+                return false;
+            }
+        }
+        self.supported_platforms.iter().any(|item| item == platform)
+            && (game.is_none()
+                || self.supported_games.is_empty()
+                || self
+                    .supported_games
+                    .iter()
+                    .any(|item| Some(item.as_str()) == game))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry() -> MarketplaceEntry {
+        MarketplaceEntry {
+            id: "example.overlay".to_string(),
+            name: "Example Overlay".to_string(),
+            description: "External launcher integration".to_string(),
+            author: "SSMT".to_string(),
+            version: "0.1.0".to_string(),
+            download_url: "https://example.com/example.overlay.ssmtpkg".to_string(),
+            sha256: "a".repeat(64),
+            minimum_ssmt_version: ">=4.x".to_string(),
+            maximum_ssmt_version: None,
+            supported_platforms: vec!["windows-x64".to_string()],
+            supported_games: vec!["GIMI".to_string()],
+            package_size: 1234,
+            permissions: vec![PluginPermission::ProcessSpawn],
+            external_dependencies: Vec::new(),
+            bundled_third_party_payloads: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn accepts_curated_catalog_entry() {
+        MarketplaceCatalog {
+            schema_version: 1,
+            entries: vec![entry()],
+        }
+        .validate()
+        .unwrap();
+    }
+
+    #[test]
+    fn catalog_checks_dependency_download_sources_too() {
+        let mut value = entry();
+        value.external_dependencies = serde_json::from_value(serde_json::json!([
+            {"id":"tool","type":"directory","downloadUrl":"javascript:alert(1)"}
+        ]))
+        .unwrap();
+        let mut catalog = MarketplaceCatalog {
+            schema_version: 1,
+            entries: vec![value],
+        };
+        assert!(catalog.validate().is_err());
+        catalog.entries[0].external_dependencies[0].download_url =
+            Some("https://example.com/tool/releases".into());
+        catalog.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_insecure_url_and_bad_hash() {
+        let mut value = entry();
+        value.download_url = "http://example.com/plugin.ssmtpkg".to_string();
+        assert!(matches!(
+            (MarketplaceCatalog {
+                schema_version: 1,
+                entries: vec![value]
+            })
+            .validate(),
+            Err(MarketplaceError::InvalidUrl(_))
+        ));
+        let mut value = entry();
+        value.sha256 = "bad".to_string();
+        assert!(matches!(
+            (MarketplaceCatalog {
+                schema_version: 1,
+                entries: vec![value]
+            })
+            .validate(),
+            Err(MarketplaceError::InvalidHash(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_versions_and_unknown_platforms() {
+        let first = entry();
+        let second = first.clone();
+        assert!(matches!(
+            (MarketplaceCatalog {
+                schema_version: 1,
+                entries: vec![first, second]
+            })
+            .validate(),
+            Err(MarketplaceError::DuplicateEntry(_))
+        ));
+        let mut value = entry();
+        value.supported_platforms = vec!["linux-x64".to_string()];
+        assert!(matches!(
+            (MarketplaceCatalog {
+                schema_version: 1,
+                entries: vec![value]
+            })
+            .validate(),
+            Err(MarketplaceError::UnsupportedPlatform(_))
+        ));
+    }
+
+    #[test]
+    fn allows_disclosed_third_party_payloads() {
+        let mut value = entry();
+        value.bundled_third_party_payloads = vec!["EffectHost.dll".to_string()];
+        assert!(MarketplaceCatalog {
+            schema_version: 1,
+            entries: vec![value]
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn verifies_downloaded_package_hash() {
+        let path =
+            std::env::temp_dir().join(format!("ssmt-marketplace-hash-{}", std::process::id()));
+        std::fs::write(&path, b"fixture package").unwrap();
+        let expected = format!("{:x}", Sha256::digest(b"fixture package"));
+        verify_package_sha256(&path, &expected).unwrap();
+        assert!(matches!(
+            verify_package_sha256(&path, &"0".repeat(64)),
+            Err(MarketplaceError::HashMismatch { .. })
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn applies_minimum_maximum_platform_and_game_compatibility() {
+        let mut value = entry();
+        value.maximum_ssmt_version = Some("4.9.0".to_string());
+        assert!(value.supports("4.1.89", "windows-x64", Some("GIMI")));
+        assert!(!value.supports("5.0.0", "windows-x64", Some("GIMI")));
+        assert!(!value.supports("4.1.89", "windows-x64", Some("ZZMI")));
+    }
+}

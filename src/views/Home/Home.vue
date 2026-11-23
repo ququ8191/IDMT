@@ -1,0 +1,1464 @@
+<script setup lang="ts">
+import { computed, ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { ElMessage } from 'element-plus'
+import { ArrowDown, ArrowUp, Picture, VideoCamera, VideoPause, VideoPlay } from '@element-plus/icons-vue'
+import { useI18n } from 'vue-i18n'
+import { AppStateManager, BGType } from '../../store/AppStateManager'
+
+import { openPath, openUrl } from '@tauri-apps/plugin-opener'
+import { mkdir } from '@tauri-apps/plugin-fs'
+import { open } from '@tauri-apps/plugin-dialog'
+import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { useRouter } from 'vue-router'
+import { ResourceManager, type UpdateInfo, type BackgroundEntry, type GameNewsContent } from '../../store/ResourceManager'
+import { handOffModInstallDrop } from '../../store/ModInstallDropBus'
+import { join } from '@tauri-apps/api/path'
+import { getVersion } from '@tauri-apps/api/app'
+import { PathHelper } from '../../helper/PathHelper'
+import GameSettingsModal from '../../components/GameSettingsModal.vue'
+import SettingsMenu from '../../components/SettingsMenu.vue'
+import HomeGameSidebar from '../../components/HomeGameSidebar.vue'
+import ReleaseNotesMarkdown from '../../components/ReleaseNotesMarkdown.vue'
+import { LaunchMonitor } from '../../store/LaunchMonitor'
+
+import { LaunchGame } from '../../common/LaunchGame';
+import { isExistingLaunchFile as isUsableClient } from '../../common/LaunchPath';
+import { resolveClientEntry, supportsGameMaintenance, type DiscoveredClient } from '../../features/gameMaintenance/entry';
+import { useHomeMaintenance } from '../../features/gameMaintenance/useHomeMaintenance';
+import { isRemoteVersionNewer, pickNewerUpdate, UPDATE_CHECK_TIMEOUT_MS } from '../../common/UpdateCheckUtils';
+
+import { GameConfig, GameConfigManager } from '../../store/GameConfig';
+import { getGithubRepoByGamePreset } from '../../store/GamePreset';
+import {
+  checkAndInstallAppUpdate,
+  isInstallingAppUpdate,
+} from '../../common/AppSelfUpdate'
+
+const appSettings = AppStateManager.appSettings;
+const { t, locale } = useI18n()
+const router = useRouter()
+let unlistenNativeDrop: UnlistenFn | null = null;
+const currentGameConfig = ref<GameConfig>(GameConfigManager.defaultGameConfig())
+const appVersion = ref('')
+const clientMissing = ref(false)
+const checkingClient = ref(false)
+let configRequest = 0
+
+const loadCurrentGameConfig = async () => {
+  const request = ++configRequest
+  const gameName = appSettings.CurrentGameName?.trim()
+  if (!gameName || gameName === 'Default') {
+    currentGameConfig.value = GameConfigManager.defaultGameConfig()
+    clientMissing.value = false
+    return
+  }
+
+  try {
+    const config = await ResourceManager.loadGameConfig(gameName)
+    const missing = supportsGameMaintenance(config.gamePreset) && !(await isUsableClient((config.targetExePath || '').trim()))
+    if (request !== configRequest || gameName !== appSettings.CurrentGameName?.trim()) return
+    currentGameConfig.value = config
+    clientMissing.value = missing
+  } catch (error) {
+    if (request !== configRequest) return
+    console.error('Failed to load current game config:', error)
+    currentGameConfig.value = GameConfigManager.defaultGameConfig()
+  }
+}
+
+const packageVersionText = computed(() => {
+  const packageVersion = (currentGameConfig.value.packageVersion || '').trim()
+  if (!packageVersion) {
+    return ''
+  }
+
+  const gamePreset = (currentGameConfig.value.gamePreset || '').trim()
+  if (!gamePreset) {
+    return `Package ${packageVersion}`
+  }
+
+  const repo = getGithubRepoByGamePreset(gamePreset)
+  if (!repo) {
+    return `Package ${packageVersion}`
+  }
+
+  const repoName = repo.split('/').pop()?.trim()
+  if (!repoName) {
+    return `Package ${packageVersion}`
+  }
+
+  return `${repoName} ${packageVersion}`
+})
+
+
+const packageReleaseDescriptionText = computed(() => {
+  const description = (currentGameConfig.value.packageReleaseDescription || '').trim()
+  return description || t('home.versionInfo.noReleaseNotes')
+})
+
+
+const appVersionText = computed(() => {
+  const version = appVersion.value.trim()
+  if (!version) {
+    return ''
+  }
+  return `SSMT ${version}`
+})
+
+const openAppReleasePage = async () => {
+  try {
+    await openUrl('https://github.com/Perxenic-Acid/SSMT4/releases')
+  } catch (error) {
+    ElMessage.error(t('home.messages.operationFailed', { error: String(error) }))
+  }
+}
+
+const handleCheckAndInstallAppUpdate = async () => {
+  await checkAndInstallAppUpdate('manual')
+}
+
+const hasVersionInfo = computed(() => Boolean(packageVersionText.value || appVersionText.value))
+
+const openHomeLink = async (url: string) => {
+  if (!url) return
+  try { await openUrl(url) } catch (error) { console.error('Failed to open home link:', error) }
+}
+
+const gameNews = ref<GameNewsContent>({ banners: [], posts: [] })
+const gameNewsTab = ref<'activity' | 'announcement' | 'info'>('activity')
+const gameNewsBannerIndex = ref(0)
+const gameNewsLoading = ref(false)
+let gameNewsRequestId = 0
+let gameNewsTimer: ReturnType<typeof setInterval> | null = null
+const gameNewsTabs = computed(() => [
+  { key: 'activity' as const, label: t('home.gameNews.activity') },
+  { key: 'announcement' as const, label: t('home.gameNews.announcement') },
+  { key: 'info' as const, label: t('home.gameNews.info') },
+])
+const gameNewsPosts = computed(() => gameNews.value.posts.filter(post => {
+  if (gameNewsTab.value === 'activity') return post.type === 'POST_TYPE_ACTIVITY'
+  if (gameNewsTab.value === 'announcement') return post.type === 'POST_TYPE_ANNOUNCE'
+  return post.type === 'POST_TYPE_INFO'
+}))
+const currentGameNewsBanner = computed(() => gameNews.value.banners[gameNewsBannerIndex.value] || null)
+const loadGameNews = async () => {
+  if (!appSettings.showHomeLauncherContent || !appSettings.showHomeGameNews) {
+    gameNews.value = { banners: [], posts: [] }
+    return
+  }
+  const preset = (currentGameConfig.value.gamePreset || '').trim().toUpperCase()
+  if (!preset) return
+  const requestId = ++gameNewsRequestId
+  gameNewsLoading.value = true
+  try {
+    const content = await ResourceManager.getGameNews(preset)
+    if (requestId !== gameNewsRequestId) return
+    gameNews.value = content
+    gameNewsBannerIndex.value = 0
+  } catch (error) {
+    if (requestId === gameNewsRequestId) {
+      gameNews.value = { banners: [], posts: [] }
+      console.warn('Failed to load game news:', error)
+    }
+  } finally {
+    if (requestId === gameNewsRequestId) gameNewsLoading.value = false
+  }
+}
+
+const currentGame = computed(() => AppStateManager.gamesList.find(game => game.name === appSettings.CurrentGameName))
+const showBackgroundControls = ref(false)
+const backgroundEntries = computed(() => {
+  const game = currentGame.value
+  if (!game) return []
+  if (game.backgroundEntries?.length) return game.backgroundEntries
+  const images = game.bgImages?.length ? game.bgImages : [game.bgPath].filter(Boolean) as string[]
+  const videos = game.bgVideos?.length ? game.bgVideos : [game.bgVideoPath].filter(Boolean) as string[]
+  return ([
+    ...images.map((path, index) => ({ id: `image-${index}`, type: BGType.Image, imagePath: path })),
+    ...videos.map((path, index) => ({ id: `video-${index}`, type: BGType.Video, videoPath: path, themePath: game.bgThemePath })),
+  ] as BackgroundEntry[])
+})
+const canSwitchBackground = computed(() => backgroundEntries.value.length > 1)
+const currentBackgroundIndex = computed(() => currentGame.value?.bgIndex || 0)
+const currentBackgroundIsVideo = computed(() => appSettings.bgType === BGType.Video && backgroundEntries.value[currentBackgroundIndex.value]?.type === BGType.Video)
+const backgroundVideoPaused = ref(false)
+const toggleBackgroundVideo = async () => {
+  const video = document.querySelector<HTMLVideoElement>('.bg-layer video.bg-item')
+  if (!video) return
+  if (video.paused) {
+    try {
+      await video.play()
+      backgroundVideoPaused.value = false
+    } catch (error) {
+      console.warn('Background video playback failed:', error)
+    }
+  } else {
+    video.pause()
+    backgroundVideoPaused.value = true
+  }
+}
+const applyBackgroundAt = async (index: number) => {
+  const game = currentGame.value
+  const entries = backgroundEntries.value
+  if (!game || !entries.length) return
+  const normalized = (index + entries.length) % entries.length
+  const selectedEntry = entries[normalized]
+  if (!selectedEntry) return
+  AppStateManager.applyBackgroundEntry(game, normalized)
+  try {
+    // Persist the entry captured from the original game through a per-game
+    // transaction so another config writer cannot be overwritten.
+    await ResourceManager.updateGameConfig(game.name, latest => ({
+      ...latest,
+      backgroundType: selectedEntry.type,
+      selectedBackgroundId: selectedEntry.id,
+    }))
+  } catch (error) {
+    console.warn('Failed to persist selected background', error)
+  }
+}
+const stepBackground = (delta: number) => {
+  if (!canSwitchBackground.value) return
+  void applyBackgroundAt(currentBackgroundIndex.value + delta)
+}
+const handleBackgroundFocusOut = (event: FocusEvent) => {
+  const rail = event.currentTarget as HTMLElement | null
+  const next = event.relatedTarget as Node | null
+  if (!next || !rail?.contains(next)) showBackgroundControls.value = false
+}
+const selectBackground = (index: number) => {
+  void applyBackgroundAt(index)
+}
+
+const open3dmigotoFolder = async () => {
+  const gameName = appSettings.CurrentGameName;
+  if (!gameName || gameName === 'Default') return;
+
+  try {
+    const path = await PathHelper.GetCurrentGame3DmigotoFolderPath();
+
+    if (path) {
+      await mkdir(path, { recursive: true });
+      await openPath(path);
+    } else {
+      console.warn('No 3Dmigoto path found and no cache dir set.');
+    }
+  } catch (e) {
+    console.error('Failed to open 3Dmigoto folder:', e);
+  }
+};
+
+const openD3dxIni = async () => {
+  const gameName = appSettings.CurrentGameName;
+  if (!gameName || gameName === 'Default') return;
+
+  try {
+    const path = await PathHelper.GetCurrentGame3DmigotoFolderPath();
+
+    if (path) {
+      await mkdir(path, { recursive: true });
+      const iniPath = await join(path, 'd3dx.ini');
+      await openPath(iniPath);
+    }
+  } catch (e) {
+    console.error('Failed to open d3dx.ini:', e);
+  }
+};
+
+const showSettings = ref(false);
+const settingsModalRef = ref<InstanceType<typeof GameSettingsModal> | null>(null);
+const isUpdatingPackage = ref(false);
+const {
+  status: maintenanceStatus, ownTask: maintenanceTask, running: maintenanceRunning, busy: maintenanceBusy,
+  needsUpdate: gameNeedsUpdate, canPreload, progress: maintenanceProgress, error: maintenanceError,
+  start: startMaintenance, pause: pauseMaintenance, refresh: refreshMaintenance, poll: pollMaintenance,
+} = useHomeMaintenance(() => appSettings.CurrentGameName, () => currentGameConfig.value, () => { void loadCurrentGameConfig(); });
+const showPreload = computed(() => canPreload.value || (maintenanceTask.value?.operation === 'preload' && maintenanceRunning.value));
+const preloadCompleted = computed(() => maintenanceTask.value?.operation === 'preload' && maintenanceTask.value.state === 'completed'
+  && maintenanceTask.value.targetVersion === maintenanceStatus.value?.preDownloadVersion);
+const mainButtonText = computed(() => {
+  if (checkingClient.value) return locale.value.startsWith('zh') ? '查找游戏…' : 'Finding game…';
+  if (maintenanceBusy.value) return locale.value.startsWith('zh') ? '正在处理…' : 'Working…';
+  if (maintenanceStatus.value?.recoveryPending) return locale.value.startsWith('zh') ? '恢复客户端' : 'Restore client';
+  if (clientMissing.value) return locale.value.startsWith('zh') ? '安装游戏' : 'Install game';
+  return gameNeedsUpdate.value ? (locale.value.startsWith('zh') ? '更新游戏' : 'Update game') : t('home.actions.startGame');
+});
+const isStartButtonDisabled = computed(() => (
+  isLaunching.value
+  || isUpdatingPackage.value
+  || checkingClient.value
+  || maintenanceBusy.value
+));
+
+const openGameMaintenance = async () => {
+  showSettings.value = true;
+  await nextTick();
+  await settingsModalRef.value?.openGameMaintenance();
+};
+
+const specifyInstalledClient = async () => {
+  const gameName = appSettings.CurrentGameName;
+  if (!gameName || isStartButtonDisabled.value) return;
+  try {
+    const path = await open({ multiple: false, filters: [{ name: locale.value.startsWith('zh') ? '游戏程序' : 'Game executable', extensions: ['exe'] }] });
+    if (typeof path !== 'string' || gameName !== appSettings.CurrentGameName) return;
+    if (!(await isUsableClient(path))) {
+      ElMessage.warning(locale.value.startsWith('zh') ? '所选路径不是可访问的文件，请重新选择游戏程序。' : 'The selected file is unavailable. Select the game executable again.');
+      return;
+    }
+    ++configRequest;
+    const config = await ResourceManager.loadGameConfig(gameName);
+    if (gameName !== appSettings.CurrentGameName) return;
+    config.targetExePath = path;
+    await ResourceManager.saveGameConfig(gameName, config);
+    await loadCurrentGameConfig();
+  } catch (error) { ElMessage.error(String(error)); }
+};
+
+type StartGameUpdateCheckResult = {
+  packageUpdate: UpdateInfo | null;
+};
+
+type LaunchPrecheckConfig = Pick<GameConfig, 'packageVersion' | 'gamePreset' | 'check3DmigotoPackageUpdateBeforeLaunch' | 'includePrereleaseUpdates'>;
+
+const openSettingsTo3Dmigoto = () => {
+  showSettings.value = true;
+  // Ensure modal is mounted before switching tabs.
+  setTimeout(() => {
+    settingsModalRef.value?.switchTab('3dmigoto');
+  }, 100);
+};
+
+const check3DMigotoPackageUpdate = async () => {
+  if (isUpdatingPackage.value) return;
+  isUpdatingPackage.value = true;
+  try {
+    const updated = await settingsModalRef.value?.runPackageUpdate();
+    if (updated) {
+      await loadCurrentGameConfig()
+    }
+    return updated
+  } finally {
+    isUpdatingPackage.value = false;
+  }
+};
+
+const precheckStartGameUpdates = async (config: LaunchPrecheckConfig): Promise<StartGameUpdateCheckResult> => {
+  const gamePreset = (config.gamePreset || '').trim();
+  const currentPackageVersion = (config.packageVersion || '').trim();
+  const shouldCheckPackageUpdate = config.check3DmigotoPackageUpdateBeforeLaunch !== false;
+
+  const packagePromise = shouldCheckPackageUpdate && currentPackageVersion && gamePreset && getGithubRepoByGamePreset(gamePreset)
+    ? pickNewerUpdate(
+      () => ResourceManager.get3DMigotoLatestRelease(
+        gamePreset,
+        appSettings.githubToken,
+        config.includePrereleaseUpdates ?? appSettings.includePrereleaseUpdates,
+      ),
+      currentPackageVersion,
+      UPDATE_CHECK_TIMEOUT_MS,
+      (current, remote) => {
+        if (gamePreset.toUpperCase() === 'IDENTITYV') {
+          if (/^source-[a-f0-9]{40}$/i.test(current) && /^v?\d+(?:\.\d+)+/i.test(remote)) return true
+          if (/^source-[a-f0-9]{40}$/i.test(remote)) return current !== remote
+        }
+        return isRemoteVersionNewer(current, remote)
+      },
+    )
+    : Promise.resolve(null);
+
+  const packageUpdate = await packagePromise;
+
+  return {
+    packageUpdate,
+  };
+};
+
+const installPrecheckedUpdatesBeforeLaunch = async () => {
+  if (isUpdatingPackage.value) {
+    return;
+  }
+
+  const gameName = appSettings.CurrentGameName?.trim();
+  if (!gameName || gameName === 'Default') {
+    return;
+  }
+
+  isUpdatingPackage.value = true;
+  try {
+    const latestConfig = await ResourceManager.loadGameConfig(gameName);
+    currentGameConfig.value = latestConfig;
+
+    if (latestConfig.check3DmigotoPackageUpdateBeforeLaunch === false) {
+      return;
+    }
+
+    const { packageUpdate } = await precheckStartGameUpdates(latestConfig);
+
+    if (packageUpdate) {
+      const updated = await settingsModalRef.value?.installPackageUpdateWithInfo(packageUpdate);
+      if (updated) {
+        await loadCurrentGameConfig();
+      }
+    }
+  } finally {
+    isUpdatingPackage.value = false;
+  }
+};
+
+// Start Game Logic
+const isLaunching = computed(() => LaunchMonitor.state.launching);
+
+const launchGame = async (event?: MouseEvent) => {
+  if (isStartButtonDisabled.value) return;
+
+  const gameName = appSettings.CurrentGameName;
+  if (!gameName || gameName === 'Default') {
+    ElMessage.info(t('home.messages.selectGameConfigFirst'));
+    return;
+  }
+
+  // 安装入口在更新 Runtime、检查插件和展开启动控制台之前处理。
+  checkingClient.value = true;
+  try {
+    const config = await ResourceManager.loadGameConfig(gameName);
+    const entry = await resolveClientEntry(config, {
+      isFile: isUsableClient,
+      discover: gamePreset => invoke<DiscoveredClient | null>('find_game_executable', { gamePreset, quickOnly: true }),
+    });
+    if (gameName !== appSettings.CurrentGameName) return;
+    if (entry.discovered) {
+      const latest = await ResourceManager.loadGameConfig(gameName);
+      if (gameName !== appSettings.CurrentGameName) return;
+      if ((latest.targetExePath || '') !== (config.targetExePath || '')) { await loadCurrentGameConfig(); return; }
+      latest.targetExePath = entry.discovered.targetExePath;
+      latest.launcherExePath ||= entry.discovered.launcherExePath;
+      await ResourceManager.saveGameConfig(gameName, latest);
+      Object.assign(config, latest);
+    }
+    currentGameConfig.value = config;
+    clientMissing.value = entry.needsInstallation;
+    if (entry.needsInstallation) { await openGameMaintenance(); return; }
+    if (entry.discovered) void refreshMaintenance();
+    if (gameName !== appSettings.CurrentGameName) return;
+    if (maintenanceStatus.value?.recoveryPending) { await openGameMaintenance(); return; }
+    if (gameNeedsUpdate.value) {
+      if (!(await startMaintenance('update'))) await openGameMaintenance();
+      return;
+    }
+  } catch (error) { ElMessage.error(String(error)); return; }
+  finally { checkingClient.value = false; }
+
+  let result: Awaited<ReturnType<typeof LaunchGame.launch>> = false;
+  try {
+    await LaunchMonitor.begin();
+    LaunchMonitor.handleEvent({ event: 'checking_updates' });
+    await installPrecheckedUpdatesBeforeLaunch();
+    LaunchMonitor.handleEvent({ event: 'preparing_launch' });
+    result = await LaunchGame.launch(
+      gameName,
+      appSettings,
+      check3DMigotoPackageUpdate,
+      openSettingsTo3Dmigoto,
+      event?.ctrlKey ?? false
+    );
+  } catch (error) {
+    LaunchMonitor.handleEvent({ event: 'launch_error', message: String(error) });
+  } finally {
+    LaunchMonitor.finish(result !== false, result === 'native');
+  }
+}
+
+onMounted(() => {
+  void getVersion()
+    .then(version => {
+      appVersion.value = version
+    })
+    .catch(error => {
+      console.error('Failed to get app version:', error)
+    })
+
+  // 主页拖入压缩包/文件夹 → 转交模组管理页安装(仅主页与模组管理页触发)。
+  void listen<{ paths: string[] }>('tauri://drag-drop', async (event) => {
+    if (router.currentRoute.value.path !== '/') return;
+    const paths = (event.payload?.paths ?? []).map(path => path.trim()).filter(Boolean);
+    if (paths.length === 0) return;
+    if (!AppStateManager.hasSelectedGame()) {
+      ElMessage.info(t('home.messages.selectGameConfigFirst'));
+      return;
+    }
+    handOffModInstallDrop(paths);
+    await router.push('/mods');
+  }).then((unlisten) => {
+    unlistenNativeDrop = unlisten;
+  }).catch((error) => {
+    console.error('Failed to attach Home drop listener', error);
+  });
+
+  gameNewsTimer = setInterval(() => {
+    if (gameNews.value.banners.length > 1) {
+      gameNewsBannerIndex.value = (gameNewsBannerIndex.value + 1) % gameNews.value.banners.length
+    }
+  }, 6000)
+});
+
+onUnmounted(() => {
+  unlistenNativeDrop?.();
+  unlistenNativeDrop = null;
+  if (gameNewsTimer) clearInterval(gameNewsTimer)
+  gameNewsTimer = null
+});
+
+watch(
+  () => appSettings.CurrentGameName,
+  () => {
+    void loadCurrentGameConfig()
+  },
+  { immediate: true }
+)
+
+watch(
+  [() => currentGameConfig.value.gamePreset, () => appSettings.showHomeLauncherContent, () => appSettings.showHomeGameNews],
+  () => { void loadGameNews() },
+  { immediate: true },
+)
+
+watch(() => appSettings.bgVideo, () => { backgroundVideoPaused.value = false })
+watch(showSettings, visible => {
+  if (!visible) { void loadCurrentGameConfig(); void refreshMaintenance(); void pollMaintenance(); }
+})
+</script>
+
+<template>
+  <div class="home-container" :class="{ 'has-game-sidebar': appSettings.homeGameSidebarPinned }"
+    :style="{ '--action-bar-width': showPreload ? '460px' : '310px' }">
+    <div class="home-sidebar-slot" :inert="!appSettings.homeGameSidebarPinned">
+      <Transition name="home-game-sidebar">
+        <HomeGameSidebar v-if="appSettings.homeGameSidebarPinned" />
+      </Transition>
+    </div>
+    <div class="home-main">
+    <div class="content-area">
+    </div>
+
+    <div class="home-left-column">
+    <div v-if="appSettings.showHomeLauncherContent && hasVersionInfo" class="version-info-panel">
+      <el-popover v-if="appVersionText" trigger="hover" placement="top-start" :width="220"
+        popper-class="version-info-popper version-info-popper-menu">
+        <template #reference>
+          <div class="version-info-chip">{{ appVersionText }}</div>
+        </template>
+        <div class="version-popover-menu">
+          <button class="version-popover-menu-item" @click="handleCheckAndInstallAppUpdate">
+            {{ isInstallingAppUpdate ? t('settings.actions.installingUpdate') : t('settings.actions.checkAppUpdate') }}
+          </button>
+          <button class="version-popover-menu-item" @click="openAppReleasePage">
+            {{ t('settings.about.releasePage') }}
+          </button>
+        </div>
+      </el-popover>
+
+      <el-popover v-if="packageVersionText" trigger="hover" placement="top-start" :width="420"
+        popper-class="version-info-popper">
+        <template #reference>
+          <div class="version-info-chip">{{ packageVersionText }}</div>
+        </template>
+        <div class="version-popover-content">
+          <div class="version-popover-title">{{ t('home.versionInfo.packageTitle') }}</div>
+          <div class="version-popover-version">{{ packageVersionText }}</div>
+          <ReleaseNotesMarkdown class="version-popover-body" :content="packageReleaseDescriptionText" compact />
+        </div>
+      </el-popover>
+
+    </div>
+
+    <div
+      v-if="appSettings.showHomeLauncherContent && appSettings.showHomeGameNews && (gameNews.banners.length || gameNews.posts.length || gameNewsLoading)"
+      class="home-launcher-links">
+      <section class="home-news-panel">
+        <button v-if="currentGameNewsBanner || gameNewsLoading" type="button" class="home-news-banner"
+          :aria-busy="gameNewsLoading" :disabled="!currentGameNewsBanner"
+          :aria-label="currentGameNewsBanner ? t('home.gameNews.info') : undefined"
+          @click="currentGameNewsBanner && openHomeLink(currentGameNewsBanner.link)">
+          <img v-if="currentGameNewsBanner" :src="currentGameNewsBanner.imageUrl" alt="" />
+          <span v-if="currentGameNewsBanner" class="home-news-banner-dots"><i v-for="(_, index) in gameNews.banners" :key="index"
+              :class="{ active: gameNewsBannerIndex === index }"></i></span>
+        </button>
+        <div class="home-news-tabs">
+          <button v-for="tab in gameNewsTabs" :key="tab.key" type="button" :class="{ active: gameNewsTab === tab.key }"
+            @click="gameNewsTab = tab.key">{{ tab.label }}</button>
+        </div>
+        <div class="home-news-list">
+          <button v-for="post in gameNewsPosts" :key="post.id" class="home-news-item" type="button"
+            @click="openHomeLink(post.link)"><span>{{ post.title }}</span><time>{{ post.date }}</time></button>
+          <div v-if="!gameNewsLoading && gameNewsPosts.length === 0" class="home-news-empty">{{ t('home.gameNews.empty')
+            }}
+          </div>
+        </div>
+      </section>
+    </div>
+    </div>
+
+    <div v-if="appSettings.showHomeLauncherContent && canSwitchBackground" class="home-background-hotzone"
+      @mouseenter="showBackgroundControls = true" @mouseleave="showBackgroundControls = false">
+      <aside class="home-background-rail" :class="{ 'is-visible': showBackgroundControls }"
+        @mouseenter="showBackgroundControls = true"
+        @focusin="showBackgroundControls = true"
+        @focusout="handleBackgroundFocusOut">
+        <button v-if="currentBackgroundIsVideo" type="button" class="home-background-playback"
+          :title="t('home.launcherLinks.toggleVideoPlayback')" @click="toggleBackgroundVideo">
+          <el-icon>
+            <VideoPlay v-if="backgroundVideoPaused" />
+            <VideoPause v-else />
+          </el-icon>
+        </button>
+        <button type="button" class="home-background-arrow" :title="t('home.launcherLinks.previousBackground')"
+          @click="stepBackground(-1)">
+          <el-icon>
+            <ArrowUp />
+          </el-icon>
+        </button>
+        <div class="home-background-list">
+          <el-tooltip
+            v-for="(entry, index) in backgroundEntries"
+            :key="entry.id"
+            :content="entry.type === BGType.Video ? t('home.launcherLinks.videoBackground') : t('home.launcherLinks.imageBackground')"
+            placement="left"
+            :show-after="160"
+          >
+            <button type="button"
+              class="home-background-thumb" :class="{ active: currentBackgroundIndex === index }"
+              @click="selectBackground(index)">
+              <span class="home-background-thumb-image"
+                :style="{ backgroundImage: `url(${entry.imagePath || entry.themePath || entry.videoPath || ''})` }"></span>
+              <span class="home-background-thumb-type">
+                <el-icon>
+                  <VideoCamera v-if="entry.type === BGType.Video" />
+                  <Picture v-else />
+                </el-icon>
+              </span>
+            </button>
+          </el-tooltip>
+        </div>
+        <button type="button" class="home-background-arrow" :title="t('home.launcherLinks.nextBackground')"
+          @click="stepBackground(1)">
+          <el-icon>
+            <ArrowDown />
+          </el-icon>
+        </button>
+      </aside>
+    </div>
+
+    <div class="action-bar">
+      <div v-if="showPreload" class="home-preload-area">
+        <button class="home-preload-button" type="button" :disabled="maintenanceRunning || preloadCompleted" @click="startMaintenance('preload')">
+          <el-icon><ArrowDown /></el-icon>
+          {{ preloadCompleted ? (locale.startsWith('zh') ? '预下载完成' : 'Ready') : (locale.startsWith('zh') ? '预下载' : 'Pre-download') }}
+          <span v-if="maintenanceRunning && maintenanceTask?.operation === 'preload' && maintenanceTask.bytesTotal">{{ maintenanceProgress }}%</span>
+        </button>
+        <progress v-if="maintenanceRunning && maintenanceTask?.operation === 'preload' && maintenanceTask.bytesTotal" :value="maintenanceProgress" max="100" :title="maintenanceTask.message" />
+      </div>
+      <div v-if="maintenanceTask?.state === 'running' || maintenanceTask?.state === 'failed' || maintenanceError" class="home-maintenance-progress" role="status">
+        <span :title="maintenanceTask?.message">{{ maintenanceError || maintenanceTask?.message }}</span>
+        <span v-if="maintenanceRunning && maintenanceTask?.bytesTotal">{{ maintenanceProgress }}%</span>
+        <button v-if="maintenanceRunning" type="button" :disabled="maintenanceTask?.phase === 'commit'" @click="pauseMaintenance">{{ locale.startsWith('zh') ? '暂停' : 'Pause' }}</button>
+      </div>
+      <!-- Start Game Button -->
+      <div class="start-game-area">
+      <button type="button" class="start-game-btn" :disabled="isStartButtonDisabled"
+        :class="{ 'disabled': isStartButtonDisabled }" @click="launchGame">
+        <span class="icon-wrapper">
+          <span v-if="isUpdatingPackage || checkingClient || maintenanceBusy" class="loading-spinner"></span>
+          <span v-else class="play-triangle"></span>
+        </span>
+        <span class="btn-text">{{ mainButtonText }}</span>
+      </button>
+      <button v-if="clientMissing" type="button" class="specify-installed-client" :disabled="isStartButtonDisabled" @click="specifyInstalledClient">
+        {{ locale.startsWith('zh') ? '已安装? 点击此处手动指定' : 'Already installed? Select the executable' }}
+      </button>
+      </div>
+
+      <!-- Settings Menu -->
+      <SettingsMenu :show-settings="showSettings"
+        @update:show-settings="showSettings = $event"
+        @open-3dmigoto-folder="open3dmigotoFolder" @open-d3dx-ini="openD3dxIni"
+        @check-3-d-migoto-package-update="check3DMigotoPackageUpdate" />
+    </div>
+
+
+
+
+
+    </div>
+    <!-- 保持全屏设置弹窗在响应式内容容器之外。 -->
+    <GameSettingsModal ref="settingsModalRef" v-model="showSettings" :game-name="appSettings.CurrentGameName" />
+  </div>
+</template>
+
+<style scoped>
+.home-game-sidebar-enter-active, .home-game-sidebar-leave-active {
+  transition: opacity var(--motion-duration-fast) var(--motion-ease-out),
+    transform var(--motion-duration-layout) var(--motion-ease-layout);
+}
+.home-game-sidebar-enter-active { transition-delay: var(--motion-delay-handoff); }
+.home-game-sidebar-enter-from, .home-game-sidebar-leave-to {
+  opacity: 0; transform: translateX(-28px) scale(.94); pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .home-game-sidebar-enter-active, .home-game-sidebar-leave-active, .home-sidebar-slot { transition: none !important; }
+}
+
+.home-container {
+  --version-panel-gap: 24px;
+  --bottom-ui-gap: 40px;
+  --action-bar-width: 310px;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: row;
+  padding: 0;
+  box-sizing: border-box;
+  position: relative;
+}
+
+.home-sidebar-slot {
+  width: 0;
+  flex: 0 0 auto;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  overflow: hidden;
+  transition: width var(--motion-duration-layout) var(--motion-ease-layout);
+}
+
+.has-game-sidebar > .home-sidebar-slot { width: 96px; }
+
+.home-main {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  position: relative;
+  container: home-main / inline-size;
+}
+
+.content-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 40px;
+  /* Restore padding here */
+  position: relative;
+  z-index: 1;
+  /* Ensure content sits above shadow */
+}
+
+.home-left-column {
+  position: absolute;
+  left: var(--version-panel-gap);
+  bottom: 24px;
+  width: min(360px, 34cqw);
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 12px;
+  z-index: 2;
+}
+
+.version-info-panel {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.3;
+  letter-spacing: 0.02em;
+  z-index: 2;
+  flex-wrap: nowrap;
+  max-width: 100%;
+}
+
+.version-info-panel .version-info-chip { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+.home-launcher-links {
+  z-index: 2;
+  display: flex;
+  align-items: end;
+  gap: 0;
+}
+
+.home-news-panel {
+  width: 100%;
+  box-sizing: border-box;
+  height: min(410px, 54vh);
+  min-height: 300px;
+  padding: 0 14px 10px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 12px;
+  background: rgba(8, 12, 22, .66);
+  backdrop-filter: blur(14px);
+}
+
+.home-news-banner {
+  position: relative;
+  flex: 0 0 auto;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  margin: 10px 0 8px;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, .2);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.home-news-banner:disabled {
+  cursor: default;
+}
+
+.home-news-banner:focus-visible,
+.home-background-rail button:focus-visible {
+  outline: 2px solid var(--ssmt-brand-accent);
+  outline-offset: 2px;
+}
+
+.home-news-banner img {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.home-news-banner::after {
+  content: '';
+  position: absolute;
+  inset: 42% 0 0;
+  background: linear-gradient(transparent, rgba(0, 0, 0, .42));
+  pointer-events: none;
+}
+
+.home-news-banner-dots {
+  position: absolute;
+  z-index: 1;
+  right: 12px;
+  bottom: 8px;
+  display: flex;
+  gap: 5px;
+}
+
+.home-news-banner-dots i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, .48);
+}
+
+.home-news-banner-dots i.active {
+  background: #fff;
+}
+
+.home-news-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 20px;
+  margin-bottom: 6px;
+}
+
+.home-news-tabs button,
+.home-news-item {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: rgba(255, 255, 255, .58);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.home-news-tabs button.active {
+  color: rgba(255, 255, 255, .96);
+}
+
+.home-news-tabs button:hover,
+.home-news-item:hover {
+  color: rgba(255, 255, 255, .92);
+}
+
+.home-news-item {
+  display: flex;
+  width: 100%;
+  justify-content: space-between;
+  padding: 6px 0;
+  color: rgba(255, 255, 255, .86);
+  text-align: left;
+}
+
+.home-news-item span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-news-item span {
+  color: rgba(255, 255, 255, .86);
+}
+
+.home-news-item time {
+  color: rgba(255, 255, 255, .42);
+  font-size: 10px;
+}
+
+.home-news-empty {
+  padding: 13px 0 4px;
+  color: rgba(255, 255, 255, .45);
+  font-size: 11px;
+}
+
+.home-news-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 2px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, .22) transparent;
+}
+
+.home-news-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.home-news-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.home-news-list::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, .22);
+  border-radius: 4px;
+}
+
+.home-news-list::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, .4);
+}
+
+.home-background-hotzone {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: calc(var(--bottom-ui-gap) + 84px);
+  width: 86px;
+  z-index: 4;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.home-background-rail {
+  position: relative;
+  isolation: isolate;
+  width: 68px;
+  min-height: 178px;
+  align-self: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  padding: 13px 8px;
+  box-sizing: border-box;
+  opacity: 0;
+  transform: translateX(18px);
+  pointer-events: none;
+  background: transparent;
+  transition: opacity .2s ease, transform .2s ease;
+}
+
+.home-background-rail::before {
+  content: '';
+  position: absolute;
+  z-index: -1;
+  top: -104px;
+  right: -42px;
+  bottom: -104px;
+  left: -78px;
+  background: linear-gradient(90deg, transparent 0%, rgba(8, 12, 22, .16) 35%, rgba(8, 12, 22, .55) 70%, rgba(8, 12, 22, .78) 100%);
+  pointer-events: none;
+}
+
+.home-background-rail.is-visible,
+.home-background-rail:focus-within {
+  opacity: 1;
+  transform: translateX(0);
+  pointer-events: auto;
+}
+
+.home-background-arrow {
+  position: relative;
+  z-index: 1;
+  width: 30px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: rgba(255, 255, 255, .65);
+  font-size: 32px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.home-background-arrow .el-icon {
+  font-size: 32px;
+}
+
+.home-background-arrow:hover {
+  color: var(--theme-accent, var(--ssmt-brand-accent));
+}
+
+.home-background-playback {
+  position: relative;
+  z-index: 1;
+  width: 30px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: rgba(255, 255, 255, .78);
+  cursor: pointer;
+  font-size: 32px;
+}
+
+.home-background-playback:hover {
+  color: var(--theme-accent, var(--ssmt-brand-accent));
+}
+
+.home-background-list {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 238px;
+  overflow-y: auto;
+  overflow-x: visible;
+  scrollbar-width: none;
+}
+
+.home-background-list::-webkit-scrollbar {
+  display: none;
+}
+
+.home-background-thumb {
+  position: relative;
+  width: 42px;
+  height: 30px;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, .08);
+  cursor: pointer;
+  opacity: .62;
+  transition: opacity .18s ease, border-color .18s ease, transform .18s ease;
+}
+
+.home-background-thumb:hover {
+  opacity: 1;
+  transform: translateX(-2px);
+}
+
+.home-background-thumb.active {
+  opacity: 1;
+  border-color: var(--theme-accent, var(--ssmt-brand-accent));
+}
+
+.home-background-thumb-image {
+  position: absolute;
+  inset: 0;
+  background-position: center;
+  background-size: cover;
+}
+
+.home-background-thumb-type {
+  position: absolute;
+  right: 3px;
+  bottom: 1px;
+  display: flex;
+  color: rgba(255, 255, 255, .9);
+  font-size: 10px;
+  filter: drop-shadow(0 1px 2px #000);
+}
+
+.home-background-thumb-type .el-icon {
+  font-size: 10px;
+}
+
+.version-info-chip {
+  padding: 4px 14px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.06);
+  transition: all 0.25s ease;
+  position: relative;
+  cursor: default;
+  white-space: nowrap;
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.version-info-chip::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
+  pointer-events: none;
+  border-radius: 999px 999px 0 0;
+}
+
+.version-info-chip>* {
+  position: relative;
+  z-index: 2;
+}
+
+.version-info-chip:hover {
+  background: rgba(255, 255, 255, 0.035);
+  border-color: rgba(255, 255, 255, 0.1);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+  color: var(--theme-accent);
+}
+
+.version-info-chip-mode {
+  color: var(--theme-accent);
+  border-color: rgba(var(--theme-surface-tint-rgb), 0.25);
+}
+
+.version-info-chip-mode:hover {
+  color: var(--theme-accent);
+  border-color: rgba(var(--theme-surface-tint-rgb), 0.45);
+}
+
+:deep(.version-info-popper) {
+  padding: 16px 20px !important;
+}
+
+:deep(.version-info-popper)::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
+  pointer-events: none;
+  border-radius: 14px 14px 0 0;
+}
+
+.version-popover-content {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.version-popover-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(var(--theme-surface-tint-rgb), 0.6);
+}
+
+.version-popover-version {
+  font-size: 14px;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.96);
+  letter-spacing: 0.02em;
+}
+
+.version-popover-body {
+  max-height: 280px;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.55;
+  color: rgba(255, 255, 255, 0.82);
+  word-break: break-word;
+
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+}
+
+.version-popover-body::-webkit-scrollbar {
+  width: 6px;
+}
+
+.version-popover-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.version-popover-body::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.25);
+  border-radius: 4px;
+}
+
+.version-popover-body::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.42);
+}
+
+.version-popover-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.version-popover-menu-item {
+  border: 0;
+  background: rgba(var(--theme-surface-tint-rgb), 0.06);
+  color: rgba(var(--theme-surface-tint-rgb), 0.75);
+  border-radius: 8px;
+  padding: 8px 12px;
+  text-align: left;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.version-popover-menu-item:hover {
+  background: rgba(var(--theme-surface-tint-rgb), 0.12);
+  color: var(--theme-accent);
+}
+
+.action-bar {
+  position: absolute;
+  right: 40px;
+  bottom: var(--bottom-ui-gap);
+  display: flex;
+  height: 60px;
+  gap: 10px;
+  z-index: 3;
+}
+
+@container home-main (max-width: 900px) {
+  .home-left-column {
+    left: 20px;
+    bottom: 20px;
+  }
+
+  .home-background-hotzone {
+    width: 72px;
+  }
+
+  .home-background-rail {
+    width: 62px;
+  }
+}
+
+/* --- Start Game Button (Glass Card) --- */
+.start-game-area { position: relative; display: flex; }
+.home-preload-area { width: 132px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; }
+.home-preload-button { border: none; background: none; padding: 6px 3px; color: rgba(255,255,255,.84); display: flex; align-items: center; gap: 7px; font-size: 13px; cursor: pointer; }
+.home-preload-button:hover { color: var(--theme-accent); }.home-preload-button:disabled { cursor: default; opacity: .6; }
+.home-preload-area progress { width: 108px; height: 3px; accent-color: var(--theme-accent); }
+.home-maintenance-progress { position: absolute; right: 0; bottom: calc(100% + 12px); display: flex; align-items: center; gap: 10px; max-width: min(460px, 75vw); padding: 8px 12px; border-radius: 10px; background: var(--t-material-bg, rgba(15,18,26,.9)); color: var(--theme-text-primary, #eee); font-size: 12px; }
+.home-maintenance-progress > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.home-maintenance-progress button { border: none; background: none; color: var(--theme-accent); white-space: nowrap; cursor: pointer; }
+.home-maintenance-progress button:disabled { opacity: .4; cursor: default; }
+.specify-installed-client { position: absolute; top: calc(100% + 7px); right: 0; left: 0; padding: 0; background: none; border: none; color: rgba(255,255,255,.7); font-size: 11px; cursor: pointer; white-space: nowrap; }
+.specify-installed-client:hover { color: var(--theme-accent); }
+.specify-installed-client:disabled { opacity: .45; cursor: default; }
+.start-game-btn {
+  appearance: none;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 30px;
+  padding: 0 44px 0 12px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+  transition: all 0.25s ease;
+  position: relative;
+  color: rgba(255, 255, 255, 0.9);
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  font: inherit;
+  font-family: 'Microsoft YaHei', sans-serif;
+  text-align: left;
+}
+
+.start-game-btn::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
+  pointer-events: none;
+  border-radius: 30px 30px 0 0;
+}
+
+.start-game-btn>* {
+  position: relative;
+  z-index: 2;
+}
+
+.start-game-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.2);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
+  transform: translateY(-2px);
+}
+
+.start-game-btn:active {
+  transform: translateY(0) scale(0.98);
+}
+
+.start-game-btn:focus-visible {
+  outline: 2px solid var(--ssmt-brand-accent);
+  outline-offset: 3px;
+}
+
+.start-game-btn:disabled {
+  cursor: default;
+}
+
+.start-game-btn .btn-text {
+  font-size: 18px;
+  font-weight: 700;
+  margin-left: 30px;
+  letter-spacing: 2px;
+  color: rgba(255, 255, 255, 0.85);
+  transition: color 0.25s;
+}
+
+.icon-wrapper {
+  width: 36px;
+  height: 36px;
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.25s cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+.play-triangle {
+  display: block;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 6px 0 6px 10px;
+  border-color: transparent transparent transparent rgba(255, 255, 255, 0.7);
+  margin-left: 2px;
+  transition: all 0.25s cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+.loading-spinner {
+  display: block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.1);
+  border-top-color: rgba(255, 255, 255, 0.5);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.start-game-btn.disabled {
+  pointer-events: none;
+  opacity: 0.35;
+  filter: grayscale(0.6);
+}
+
+.start-game-btn:hover .btn-text {
+  color: var(--theme-accent);
+}
+
+.start-game-btn:hover .icon-wrapper {
+  background: rgba(var(--theme-surface-tint-rgb), 0.15);
+  border-color: rgba(var(--theme-surface-tint-rgb), 0.3);
+  transform: scale(1.06);
+}
+
+.start-game-btn:hover .play-triangle {
+  border-color: transparent transparent transparent var(--theme-accent);
+}
+
+.start-game-btn:active .icon-wrapper {
+  transform: scale(0.95);
+}
+
+.start-game-btn:active .play-triangle {
+  border-color: transparent transparent transparent rgba(var(--theme-surface-tint-rgb), 0.5);
+}
+
+/* Settings button styles are now in SettingsMenu.vue */
+
+@container home-main (max-width: 980px) {
+  .content-area, .version-info-panel, .home-launcher-links, .action-bar {
+    --bottom-ui-gap: 28px;
+    --version-panel-gap: 18px;
+  }
+
+  .version-info-panel {
+    gap: 4px;
+    font-size: 11px;
+  }
+
+  .version-info-chip { padding: 2px 8px; }
+
+  .action-bar {
+    right: 28px;
+  }
+}
+
+@container home-main (max-width: 720px) {
+  .action-bar {
+    right: 18px;
+  }
+
+  .start-game-btn {
+    padding-right: 28px;
+  }
+
+  .start-game-btn .btn-text {
+    margin-left: 18px;
+    font-size: 16px;
+    letter-spacing: 1px;
+  }
+}
+</style>
+
+<style>
+.version-info-popper {
+  border: var(--t-material-border) !important;
+  background: var(--t-material-bg) !important;
+  box-shadow: var(--t-material-shadow) !important;
+  border-radius: 14px !important;
+  padding: 16px 20px !important;
+}
+</style>

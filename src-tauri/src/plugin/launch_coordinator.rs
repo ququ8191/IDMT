@@ -1,0 +1,595 @@
+use super::file_transaction::FileTransactionReport;
+use super::launch_plan::{
+    resolve_hook_plan, LaunchHookPlugin, LaunchResourceConflict, ResolvedHookPlan,
+};
+use super::registry::{
+    ExternalDependencyStatus, InstalledPlugin, PluginHostConfig, PluginRegistry,
+    PluginRegistryError,
+};
+use super::PluginPermission;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LaunchRequest {
+    pub run_executable: PathBuf,
+    #[serde(default)]
+    pub game_executable: Option<PathBuf>,
+    #[serde(default)]
+    pub game_working_directory: Option<PathBuf>,
+    #[serde(default)]
+    pub game_arguments: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPlugin {
+    pub id: String,
+    pub version: String,
+    pub package_root: PathBuf,
+    pub runtime_plugins: Vec<PathBuf>,
+    pub injected_dlls: Vec<PathBuf>,
+    pub launcher_adapter_count: usize,
+}
+
+impl ResolvedPlugin {
+    fn from_installed(plugin: &InstalledPlugin, executable: Option<&std::path::Path>) -> Self {
+        Self {
+            id: plugin.manifest.id.clone(),
+            version: plugin.manifest.version.clone(),
+            package_root: plugin.package_root.clone(),
+            runtime_plugins: plugin
+                .manifest
+                .contributions
+                .runtime_plugins
+                .iter()
+                .map(|runtime| plugin.package_root.join(&runtime.path))
+                .collect(),
+            injected_dlls: plugin
+                .manifest
+                .contributions
+                .injected_dlls
+                .iter()
+                .filter(|injected| injected.applies_to_executable(executable))
+                .map(|injected| plugin.package_root.join(&injected.path))
+                .collect(),
+            launcher_adapter_count: plugin.manifest.contributions.launcher_adapters.len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchPlan {
+    pub request: LaunchRequest,
+    pub enabled_plugins: Vec<ResolvedPlugin>,
+    pub injected_dlls: Vec<PathBuf>,
+    pub plugin_host_config: Option<PluginHostConfig>,
+    pub launcher_adapter_count: usize,
+    pub hook_plan: ResolvedHookPlan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchPhase {
+    Created,
+    ResolvingPlugins,
+    Preflight,
+    AdaptersPrepared,
+    RunStarted,
+    Observing,
+    CoordinatingAdapters,
+    Running,
+    TargetExited,
+    CleaningUp,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchSession {
+    pub plan: LaunchPlan,
+    pub phase: LaunchPhase,
+    pub failure: Option<String>,
+}
+
+impl LaunchSession {
+    pub fn transition(&mut self, next: LaunchPhase) -> Result<(), LaunchCoordinatorError> {
+        if !is_valid_transition(self.phase, next) {
+            return Err(LaunchCoordinatorError::InvalidTransition {
+                from: self.phase,
+                to: next,
+            });
+        }
+        self.phase = next;
+        Ok(())
+    }
+
+    pub fn fail(&mut self, error: impl Into<String>) {
+        self.failure = Some(error.into());
+        self.phase = LaunchPhase::Failed;
+    }
+
+    pub fn apply_file_hooks(
+        &self,
+        game_root: &std::path::Path,
+    ) -> Result<FileTransactionReport, String> {
+        self.plan.hook_plan.apply_file_actions(game_root)
+    }
+
+    pub fn restore_file_hooks(
+        game_root: &std::path::Path,
+        transaction_id: &str,
+    ) -> Result<bool, String> {
+        ResolvedHookPlan::restore_file_actions(game_root, transaction_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchCoordinatorError {
+    Registry(PluginRegistryErrorMessage),
+    InvalidRequest(String),
+    MissingExecutable {
+        kind: &'static str,
+        path: PathBuf,
+    },
+    MissingExternalDependency {
+        plugin_id: String,
+        dependency_id: String,
+        status: ExternalDependencyStatus,
+        reason: Option<String>,
+    },
+    MissingPermission {
+        plugin_id: String,
+        permission: PluginPermission,
+    },
+    InvalidTransition {
+        from: LaunchPhase,
+        to: LaunchPhase,
+    },
+    HookPlan(String),
+    ResourceConflict(Vec<LaunchResourceConflict>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginRegistryErrorMessage(pub String);
+
+impl fmt::Display for LaunchCoordinatorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registry(error) => write!(formatter, "plugin registry error: {}", error.0),
+            Self::InvalidRequest(error) => write!(formatter, "invalid launch request: {error}"),
+            Self::MissingExecutable { kind, path } => {
+                write!(
+                    formatter,
+                    "{kind} does not exist or is not a file: {}",
+                    path.display()
+                )
+            }
+            Self::MissingExternalDependency {
+                plugin_id,
+                dependency_id,
+                status,
+                reason,
+            } => write!(
+                formatter,
+                "plugin {plugin_id} dependency {dependency_id} is {status:?}: {}",
+                reason.as_deref().unwrap_or("no reason provided")
+            ),
+            Self::MissingPermission {
+                plugin_id,
+                permission,
+            } => write!(
+                formatter,
+                "plugin {plugin_id} is missing permission {permission:?}"
+            ),
+            Self::InvalidTransition { from, to } => {
+                write!(
+                    formatter,
+                    "invalid launch phase transition: {from:?} -> {to:?}"
+                )
+            }
+            Self::HookPlan(error) => write!(formatter, "invalid plugin launch plan: {error}"),
+            Self::ResourceConflict(conflicts) => write!(
+                formatter,
+                "plugin launch resources conflict: {}",
+                conflicts
+                    .iter()
+                    .map(|conflict| conflict.resource_key.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LaunchCoordinatorError {}
+
+impl From<PluginRegistryError> for LaunchCoordinatorError {
+    fn from(error: PluginRegistryError) -> Self {
+        Self::Registry(PluginRegistryErrorMessage(error.to_string()))
+    }
+}
+
+pub struct LaunchCoordinator<'a> {
+    registry: &'a PluginRegistry,
+}
+
+impl<'a> LaunchCoordinator<'a> {
+    pub fn new(registry: &'a PluginRegistry) -> Self {
+        Self { registry }
+    }
+
+    pub fn prepare(&self, request: LaunchRequest) -> Result<LaunchSession, LaunchCoordinatorError> {
+        validate_request(&request)?;
+        let hook_plugins = self
+            .registry
+            .selected_plugins()
+            .filter(|plugin| plugin.enabled)
+            .map(|plugin| {
+                validate_plugin_preflight(plugin)?;
+                Ok(LaunchHookPlugin::from_installed(plugin))
+            })
+            .collect::<Result<Vec<_>, LaunchCoordinatorError>>()?;
+        let hook_plan = if hook_plugins.iter().any(|plugin| !plugin.hooks.is_empty()) {
+            let game_root = request
+                .game_executable
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .or(request.game_working_directory.as_deref())
+                .ok_or_else(|| {
+                    LaunchCoordinatorError::HookPlan(
+                        "launch hooks require a game executable or working directory".to_string(),
+                    )
+                })?;
+            let plan = resolve_hook_plan(game_root, &hook_plugins)
+                .map_err(LaunchCoordinatorError::HookPlan)?;
+            if !plan.is_executable() {
+                return Err(LaunchCoordinatorError::ResourceConflict(plan.conflicts));
+            }
+            plan
+        } else {
+            ResolvedHookPlan::default()
+        };
+
+        let mut session = LaunchSession {
+            plan: LaunchPlan {
+                request,
+                enabled_plugins: Vec::new(),
+                injected_dlls: Vec::new(),
+                plugin_host_config: None,
+                launcher_adapter_count: 0,
+                hook_plan,
+            },
+            phase: LaunchPhase::Created,
+            failure: None,
+        };
+        session.transition(LaunchPhase::ResolvingPlugins)?;
+
+        let enabled_plugins = self
+            .registry
+            .selected_plugins()
+            .filter(|plugin| plugin.enabled)
+            .map(|plugin| {
+                validate_plugin_preflight(plugin)?;
+                Ok(ResolvedPlugin::from_installed(
+                    plugin,
+                    session.plan.request.game_executable.as_deref(),
+                ))
+            })
+            .collect::<Result<Vec<_>, LaunchCoordinatorError>>()?;
+        session.plan.launcher_adapter_count = enabled_plugins
+            .iter()
+            .map(|plugin| plugin.launcher_adapter_count)
+            .sum();
+        session.plan.injected_dlls = enabled_plugins
+            .iter()
+            .flat_map(|plugin| plugin.injected_dlls.iter().cloned())
+            .collect();
+        session.plan.enabled_plugins = enabled_plugins;
+
+        session.transition(LaunchPhase::Preflight)?;
+        session.plan.plugin_host_config = enabled_plugins_host_config(self.registry);
+        session.transition(LaunchPhase::AdaptersPrepared)?;
+        Ok(session)
+    }
+}
+
+fn validate_request(request: &LaunchRequest) -> Result<(), LaunchCoordinatorError> {
+    if !request.run_executable.is_file() {
+        return Err(LaunchCoordinatorError::MissingExecutable {
+            kind: "Run.exe",
+            path: request.run_executable.clone(),
+        });
+    }
+    if let Some(game_executable) = &request.game_executable {
+        if !game_executable.is_file() {
+            return Err(LaunchCoordinatorError::MissingExecutable {
+                kind: "game executable",
+                path: game_executable.clone(),
+            });
+        }
+    }
+    if let Some(working_directory) = &request.game_working_directory {
+        if !working_directory.is_dir() {
+            return Err(LaunchCoordinatorError::InvalidRequest(format!(
+                "game working directory does not exist or is not a directory: {}",
+                working_directory.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_plugin_preflight(plugin: &InstalledPlugin) -> Result<(), LaunchCoordinatorError> {
+    for (dependency_id, dependency_state) in &plugin.external_dependencies {
+        if dependency_state.status != ExternalDependencyStatus::Ready
+            && plugin.manifest.requires_dependency(dependency_id, "launch")
+        {
+            return Err(LaunchCoordinatorError::MissingExternalDependency {
+                plugin_id: plugin.manifest.id.clone(),
+                dependency_id: dependency_id.clone(),
+                status: dependency_state.status,
+                reason: dependency_state.reason.clone(),
+            });
+        }
+    }
+
+    if (!plugin.manifest.contributions.runtime_plugins.is_empty()
+        || !plugin.manifest.contributions.injected_dlls.is_empty())
+        && !has_permission(plugin, PluginPermission::NativeInject)
+    {
+        return Err(LaunchCoordinatorError::MissingPermission {
+            plugin_id: plugin.manifest.id.clone(),
+            permission: PluginPermission::NativeInject,
+        });
+    }
+
+    if !plugin.manifest.contributions.launcher_adapters.is_empty() {
+        for required in [
+            PluginPermission::ProcessSpawn,
+            PluginPermission::ProcessObserve,
+        ] {
+            if !has_permission(plugin, required.clone()) {
+                return Err(LaunchCoordinatorError::MissingPermission {
+                    plugin_id: plugin.manifest.id.clone(),
+                    permission: required,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn has_permission(plugin: &InstalledPlugin, required: PluginPermission) -> bool {
+    plugin
+        .manifest
+        .permissions
+        .iter()
+        .any(|permission| *permission == required)
+}
+
+fn enabled_plugins_host_config(registry: &PluginRegistry) -> Option<PluginHostConfig> {
+    let config = registry.generate_plugin_host_config();
+    (!config.plugins.is_empty()).then_some(config)
+}
+
+fn is_valid_transition(from: LaunchPhase, to: LaunchPhase) -> bool {
+    matches!(
+        (from, to),
+        (LaunchPhase::Created, LaunchPhase::ResolvingPlugins)
+            | (LaunchPhase::ResolvingPlugins, LaunchPhase::Preflight)
+            | (LaunchPhase::Preflight, LaunchPhase::AdaptersPrepared)
+            | (LaunchPhase::AdaptersPrepared, LaunchPhase::RunStarted)
+            | (LaunchPhase::RunStarted, LaunchPhase::Observing)
+            | (LaunchPhase::Observing, LaunchPhase::CoordinatingAdapters)
+            | (LaunchPhase::CoordinatingAdapters, LaunchPhase::Running)
+            | (LaunchPhase::Running, LaunchPhase::TargetExited)
+            | (LaunchPhase::TargetExited, LaunchPhase::CleaningUp)
+            | (LaunchPhase::CleaningUp, LaunchPhase::Completed)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plugin::registry::PluginRegistry;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ssmt-launch-coordinator-{label}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn request(root: &PathBuf) -> LaunchRequest {
+        let run = root.join("Run.exe");
+        let game = root.join("Game.exe");
+        fs::create_dir_all(root).unwrap();
+        fs::write(&run, b"run").unwrap();
+        fs::write(&game, b"game").unwrap();
+        LaunchRequest {
+            run_executable: run,
+            game_executable: Some(game),
+            game_working_directory: Some(root.clone()),
+            game_arguments: vec!["--test".to_string()],
+        }
+    }
+
+    fn write_package(root: &PathBuf, id: &str, permissions: &[&str]) {
+        let package = root.join("Plugins").join(id).join("1.0.0");
+        fs::create_dir_all(package.join("native")).unwrap();
+        fs::write(package.join("native/plugin.dll"), b"plugin").unwrap();
+        let permissions = permissions
+            .iter()
+            .map(|permission| format!(r#""{permission}""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        fs::write(
+            package.join("ssmt-plugin.json"),
+            format!(
+                r#"{{
+                  "schemaVersion": 1,
+                  "id": "{id}",
+                  "name": "Test",
+                  "version": "1.0.0",
+                  "author": "Test",
+                  "compatibility": {{"ssmt": ">=4.0.0", "platforms": ["windows-x64"]}},
+                  "contributions": {{"runtimePlugins": [{{"path": "native/plugin.dll"}}]}},
+                  "permissions": [{permissions}]
+                }}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn prepares_enabled_plugins_and_runs_phase_machine() {
+        let root = temp_root("valid");
+        write_package(&root, "ssmt.runtime", &["native.inject"]);
+        let mut registry = PluginRegistry::new(root.join("Plugins")).unwrap();
+        registry.set_enabled("ssmt.runtime", true).unwrap();
+        let coordinator = LaunchCoordinator::new(&registry);
+        let mut session = coordinator.prepare(request(&root)).unwrap();
+        assert_eq!(session.phase, LaunchPhase::AdaptersPrepared);
+        assert!(session.plan.plugin_host_config.is_some());
+        for phase in [
+            LaunchPhase::RunStarted,
+            LaunchPhase::Observing,
+            LaunchPhase::CoordinatingAdapters,
+            LaunchPhase::Running,
+            LaunchPhase::TargetExited,
+            LaunchPhase::CleaningUp,
+            LaunchPhase::Completed,
+        ] {
+            session.transition(phase).unwrap();
+        }
+        assert_eq!(session.phase, LaunchPhase::Completed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_enabled_runtime_plugin_without_native_permission() {
+        let root = temp_root("permission");
+        write_package(&root, "ssmt.runtime", &[]);
+        let mut registry = PluginRegistry::new(root.join("Plugins")).unwrap();
+        registry.set_enabled("ssmt.runtime", true).unwrap();
+        let error = LaunchCoordinator::new(&registry)
+            .prepare(request(&root))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            LaunchCoordinatorError::MissingPermission { .. }
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepares_direct_injected_dll_contribution() {
+        let root = temp_root("injected-dll");
+        let package = root.join("Plugins/example.motion/3.2.0");
+        fs::create_dir_all(package.join("plugin")).unwrap();
+        fs::write(package.join("plugin/sbm.dll"), b"plugin").unwrap();
+        fs::write(
+            package.join("ssmt-plugin.json"),
+            r#"{
+              "schemaVersion": 1,
+              "id": "example.motion",
+              "name": "Secondary Motion",
+              "version": "3.2.0",
+              "author": "SSMT",
+              "compatibility": {"ssmt": ">=4.2.0", "platforms": ["windows-x64"], "games": ["EFMI"]},
+              "contributions": {"injectedDlls": [{"path": "plugin/sbm.dll"}]},
+              "permissions": ["native.inject"]
+            }"#,
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new(root.join("Plugins")).unwrap();
+        registry
+            .set_game_enabled("EFMI", "example.motion", true)
+            .unwrap();
+        let scoped = registry.for_game("EFMI");
+        let session = LaunchCoordinator::new(&scoped)
+            .prepare(request(&root))
+            .unwrap();
+        assert_eq!(
+            session.plan.injected_dlls,
+            vec![package.join("plugin/sbm.dll")]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prepares_manifest_launch_hooks_as_generic_plan() {
+        use sha2::{Digest, Sha256};
+        let root = temp_root("launch-hooks");
+        let package = root.join("Plugins/example.launch/1.0.0");
+        fs::create_dir_all(package.join("payload")).unwrap();
+        fs::write(package.join("payload/proxy.dll"), b"payload").unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(b"payload"));
+        fs::write(
+            package.join("ssmt-plugin.json"),
+            format!(
+                r#"{{
+                  "schemaVersion": 2,
+                  "id": "example.launch",
+                  "name": "Launch",
+                  "version": "1.0.0",
+                  "author": "Example",
+                  "compatibility": {{
+                    "ssmt": ">=4.2.2",
+                    "pluginApi": ">=1.0.0 <2.0.0",
+                    "platforms": ["windows-x64"],
+                    "games": ["EFMI"]
+                  }},
+                  "contributions": {{
+                    "launchHooks": [{{
+                      "id": "proxy",
+                      "actions": [{{
+                        "type": "file-copy",
+                        "source": "payload/proxy.dll",
+                        "target": "dxgi.dll",
+                        "sha256": "{sha256}"
+                      }}]
+                    }}]
+                  }},
+                  "permissions": ["filesystem.read", "filesystem.write"]
+                }}"#
+            ),
+        )
+        .unwrap();
+        let mut registry = PluginRegistry::new(root.join("Plugins")).unwrap();
+        registry
+            .set_game_enabled("EFMI", "example.launch", true)
+            .unwrap();
+        let scoped = registry.for_game("EFMI");
+        let session = LaunchCoordinator::new(&scoped)
+            .prepare(request(&root))
+            .unwrap();
+        assert_eq!(session.plan.hook_plan.file_actions.len(), 1);
+        assert_eq!(
+            session.plan.hook_plan.file_actions[0].target_relative,
+            "dxgi.dll"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_phase_transition() {
+        let root = temp_root("transition");
+        let registry = PluginRegistry::new(root.join("Plugins")).unwrap();
+        let mut session = LaunchCoordinator::new(&registry)
+            .prepare(request(&root))
+            .unwrap();
+        assert!(matches!(
+            session.transition(LaunchPhase::Running),
+            Err(LaunchCoordinatorError::InvalidTransition { .. })
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+}

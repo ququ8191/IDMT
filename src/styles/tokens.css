@@ -1,0 +1,88 @@
+/* ═══════════════════════════════════════════════
+   SSMT4 — Design Tokens (radii, spacing, accent aliases)
+   ═══════════════════════════════════════════════
+   
+   Color/theme variables have moved to theme.css.
+   Only non-color design tokens go here.
+   ═══════════════════════════════════════════════ */
+
+:root {
+  /* ── SSMT brand and shell geometry ── */
+  --ssmt-brand-accent: #d8e94e;
+  --ssmt-brand-accent-rgb: 216, 233, 78;
+  --ssmt-brand-accent-ink: #171908;
+  --ssmt-brand-accent-soft: #eef7a0;
+  --ssmt-side-nav-width: 74px;
+  --ssmt-titlebar-height: 32px;
+  --ssmt-content-overlay-top: var(--ssmt-titlebar-height);
+  --ssmt-content-overlay-left: var(--ssmt-side-nav-width);
+
+  /* 动效：短反馈、普通位移及布局重排分开控制，交接延迟用于入口切换。 */
+  --motion-duration-fast: 160ms;
+  --motion-duration-standard: 240ms;
+  --motion-duration-layout: 280ms;
+  --motion-delay-handoff: 90ms;
+  --motion-ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --motion-ease-layout: cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  /* ── Border Radii ── */
+  --radius-modal: 24px;
+  --radius-card: 16px;
+  --radius-panel: 14px;
+  --radius-section: 10px;
+  --radius-input: 8px;
+  --radius-button: 10px;
+  --radius-badge: 999px;
+
+  /* ── Spacing ── */
+  --space-section: 22px 28px 22px 32px;
+  --space-card: 18px;
+  --space-panel: 18px;
+
+  /* ── Crystal accent aliases ── */
+  --crystal: rgba(255, 255, 255, 0.86);
+  --crystal-rgb: 255, 255, 255;
+  --crystal-bg: rgba(255, 255, 255, 0.08);
+  --crystal-border: rgba(255, 255, 255, 0.20);
+  --crystal-text: rgba(255, 255, 255, 0.70);
+  --gold: var(--crystal);
+  --gold-rgb: var(--crystal-rgb);
+  --gold-bg: var(--crystal-bg);
+  --gold-border: var(--crystal-border);
+  --gold-text: var(--crystal-text);
+
+  /* ── Semantic color aliases (reference theme.css) ── */
+  --green-bg: var(--t-success-bg, rgba(var(--theme-success-rgb), 0.08));
+  --green-border: var(--t-success-border, rgba(var(--theme-success-rgb), 0.18));
+  --green-text: var(--t-success-text, rgba(var(--theme-success-rgb), 0.85));
+  --green-hover-bg: rgba(var(--theme-success-rgb), 0.14);
+  --green-hover-border: rgba(var(--theme-success-rgb), 0.30);
+
+  --orange-bg: var(--t-warning-bg, rgba(var(--theme-warning-rgb), 0.08));
+  --orange-border: var(--t-warning-border, rgba(var(--theme-warning-rgb), 0.18));
+  --orange-text: var(--t-warning-text, rgba(var(--theme-warning-rgb), 0.85));
+  --orange-hover-bg: rgba(var(--theme-warning-rgb), 0.14);
+  --orange-hover-border: rgba(var(--theme-warning-rgb), 0.30);
+
+  --red-bg: var(--t-danger-bg, rgba(var(--theme-danger-rgb), 0.08));
+  --red-border: var(--t-danger-border, rgba(var(--theme-danger-rgb), 0.18));
+  --red-text: var(--t-danger-text, rgba(var(--theme-danger-rgb), 0.85));
+  --red-hover-bg: rgba(var(--theme-danger-rgb), 0.14);
+  --red-hover-border: rgba(var(--theme-danger-rgb), 0.30);
+}
+
+html[data-ui-mode='classic'] {
+  --ssmt-brand-accent: #75d6bb;
+  --ssmt-brand-accent-rgb: 117, 214, 187;
+  --ssmt-brand-accent-ink: #0f201c;
+  --ssmt-brand-accent-soft: #e0fff7;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-duration-fast: 0ms;
+    --motion-duration-standard: 0ms;
+    --motion-duration-layout: 0ms;
+    --motion-delay-handoff: 0ms;
+  }
+}

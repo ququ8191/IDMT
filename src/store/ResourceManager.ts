@@ -1,0 +1,1345 @@
+import { defineStore } from 'pinia';
+import { GlobalConfig } from "./GlobalConfig";
+import { SSMTFileUtils } from "../utils/SSMTFileUtils";
+
+import { exists, writeFile, remove, mkdir, readDir, writeTextFile, copyFile, rename } from '@tauri-apps/plugin-fs';
+import { join, resourceDir } from '@tauri-apps/api/path';
+import { fetch } from '@tauri-apps/plugin-http';
+import { invoke } from '@tauri-apps/api/core';
+import { SSMTJsonUtils } from '../utils/SSMTJsonUtils';
+import { PathHelper } from '../helper/PathHelper';
+import { i18n } from '../i18n';
+import { debugLog } from '../utils/debugLog';
+
+import { GameConfig, GameConfigManager } from "./GameConfig";
+import { getGithubRepoByGamePreset, isMihoyoGamePreset } from './GamePreset';
+
+const t = i18n.global.t;
+
+export type UpdateInfo = {
+    version: string;
+    description: string;
+    download_url: string;
+    is_latest?: boolean;
+    is_prerelease?: boolean;
+};
+
+type GithubReleaseQueryOptions = {
+    includePrerelease?: boolean;
+    assetMatcher?: (assetName: string) => boolean;
+};
+
+type GithubReleaseAsset = {
+    name?: string;
+    browser_download_url?: string;
+};
+
+type GithubRelease = {
+    tag_name?: string;
+    body?: string;
+    draft?: boolean;
+    prerelease?: boolean;
+    published_at?: string;
+    assets?: GithubReleaseAsset[];
+};
+
+type HypergryphEndfieldInfo = {
+    imagePath: string;
+    imageUrl: string;
+    imageMd5: string;
+    imageSha256: string;
+    imageBytes: number;
+    videoPath?: string | null;
+    videoUrl?: string | null;
+    videoSha256?: string | null;
+    videoBytes?: number | null;
+    profileId: string;
+    sourceLeveldb: string;
+    changed: boolean;
+};
+
+const ENDFIELD_MANAGED_BACKGROUND_PREFIX = 'Background-Endfield-';
+const ENDFIELD_IMAGE_ENTRY_ID = 'hypergryph-endfield-image';
+const ENDFIELD_VIDEO_ENTRY_ID = 'hypergryph-endfield-video';
+
+function localPathKey(path: string): string {
+    return path.replace(/[\\/]+/g, '\\').replace(/\\+$/g, '').toLowerCase();
+}
+
+function hasParentTraversal(path: string): boolean {
+    return /(^|[\\/])\.\.([\\/]|$)/.test(path);
+}
+
+function isPathInsideDirectory(path: string, directory: string): boolean {
+    if (hasParentTraversal(path)) return false;
+    const normalizedPath = localPathKey(path);
+    const normalizedDirectory = localPathKey(directory);
+    return normalizedPath.startsWith(`${normalizedDirectory}\\`);
+}
+
+export function isAllowedBackgroundPath(path: string, currentDirectory: string, gameDirectories: string[]): boolean {
+    if (hasParentTraversal(path)) return false;
+    if (isPathInsideDirectory(path, currentDirectory)) return true;
+    return !gameDirectories.some(directory =>
+        localPathKey(directory) !== localPathKey(currentDirectory)
+        && isPathInsideDirectory(path, directory)
+    );
+}
+
+type FixedBackgroundSource = {
+    imageUrl?: string;
+    videoUrl?: string;
+};
+
+const hypPresetToGameId: Record<string, string> = {
+    GIMI: '1Z8W5NHUQb',
+    HIMI: 'osvnlOc0S8',
+    SRMI: '64kMb5iAWu',
+    ZZMI: 'x6znKlJ0xK',
+    ZZMIDX12: 'x6znKlJ0xK',
+};
+
+export type BackgroundEntry = {
+    id: string;
+    type: BGType;
+    imagePath?: string;
+    videoPath?: string;
+    themePath?: string;
+    imageUrl?: string;
+    videoUrl?: string;
+    themeUrl?: string;
+};
+
+export type GameNewsPost = {
+    id: string;
+    type: string;
+    title: string;
+    link: string;
+    date: string;
+};
+
+export type GameNewsContent = {
+    banners: Array<{ id: string; imageUrl: string; link: string }>;
+    posts: GameNewsPost[];
+};
+
+function getBackgroundApiLanguage(): string {
+    const locale = String(i18n.global.locale.value || '').toLowerCase();
+    if (locale === 'zhs') return 'zh-cn';
+    if (locale === 'zht') return 'zh-tw';
+    if (locale === 'ja') return 'ja-jp';
+    if (locale === 'ko') return 'ko-kr';
+    if (locale === 'ru') return 'ru-ru';
+    if (locale === 'de') return 'de-de';
+    if (locale === 'fr') return 'fr-fr';
+    if (locale === 'es') return 'es-es';
+    if (locale === 'it') return 'it-it';
+    return 'en-us';
+}
+
+const fixedBackgroundSources: Record<string, FixedBackgroundSource> = {
+    NTEMI: {
+        imageUrl: 'https://yh.wanmei.com/images/cover260408/section-head-bg.jpg',
+        videoUrl: 'https://yhvmg.wmupd.com/webops/yh/yh_bgvideo_20260418.mp4',
+    },
+    WWMI: {
+        imageUrl: 'https://mc.kurogames.com/website-preface/video/bg/bg-poster.webp',
+        videoUrl: 'https://mc.kurogames.com/website-preface/video/bg/bg-video.mp4',
+    },
+};
+
+const DX12_PRESET = 'ZZMIDX12';
+const DX12_D3D12_FILE_NAME = 'd3d12.dll';
+export type BGType = 'Image' | 'Video';
+
+const BACKGROUND_IMAGE_CANDIDATES = ['Background.png', 'Background.webp', 'Background.jpg', 'Background.jpeg', 'Background.gif', 'Background.svg', 'Background.bmp', 'Background.ico', 'Background.avif'];
+const BACKGROUND_VIDEO_CANDIDATES = ['Background.mp4', 'Background.webm', 'Background.mkv', 'Background.ogg', 'Background.mov'];
+const BACKGROUND_THEME_CANDIDATES = ['BackgroundTheme.png', 'BackgroundTheme.webp', 'BackgroundTheme.jpg', 'BackgroundTheme.jpeg'];
+
+export type GameInfo = {
+    name: string;
+    icon_path: string;
+    bg_path: string;
+    bg_video_path?: string | null;
+    bg_theme_path?: string | null;
+    bg_images?: string[];
+    bg_videos?: string[];
+    background_entries?: BackgroundEntry[];
+    selected_background_id?: string;
+    bg_type: BGType;
+    show_sidebar: boolean;
+};
+
+
+export const useResourceManagerStore = defineStore('resourceManager', () => {
+    // ============================================================
+    // Reactive state
+    // ============================================================
+
+    // ============================================================
+    // Private helpers (not returned from store)
+    // ============================================================
+
+    async function findExistingFileIgnoreCase(dirPath: string, candidates: readonly string[]): Promise<string> {
+        let children: Array<{ name?: string; isDirectory?: boolean }> = [];
+        try {
+            children = await readDir(dirPath);
+        } catch {
+            return '';
+        }
+
+        const nameMap = new Map<string, string>();
+        children.forEach(child => {
+            if (child?.name) {
+                nameMap.set(child.name.toLowerCase(), child.name);
+            }
+        });
+
+        for (const candidate of candidates) {
+            const matchedName = nameMap.get(candidate.toLowerCase());
+            if (matchedName) {
+                return SSMTFileUtils.JoinPath(dirPath, matchedName);
+            }
+        }
+
+        return '';
+    }
+
+    async function getHypBackgrounds(gamePreset: string): Promise<BackgroundEntry[]> {
+        const gameId = hypPresetToGameId[gamePreset];
+        if (!gameId) {
+            return [];
+        }
+
+        const apiUrl = `https://hyp-api.mihoyo.com/hyp/hyp-connect/api/getAllGameBasicInfo?launcher_id=jGHBHlcOq1&language=${getBackgroundApiLanguage()}&game_id=${gameId}`;
+        const resp = await fetch(apiUrl, {
+            method: 'GET',
+            signal: AbortSignal.timeout(20_000),
+        });
+        if (!resp.ok) {
+            throw new Error(t('resourceManager.messages.requestFailed', { status: resp.status }));
+        }
+
+        const json = await resp.json();
+        const gameInfoList = json?.data?.game_info_list;
+        const gameInfo = Array.isArray(gameInfoList)
+            ? gameInfoList.find((item: any) => item?.game?.id === gameId)
+            : null;
+        const backgrounds = gameInfo?.backgrounds;
+        if (!Array.isArray(backgrounds) || backgrounds.length === 0) {
+            throw new Error(t('resourceManager.messages.backgroundsMissingFromServer'));
+        }
+
+        return backgrounds.map((item: any, index: number) => {
+            const imageUrl = typeof item?.background?.url === 'string' ? item.background.url.trim() : '';
+            const videoUrl = typeof item?.video?.url === 'string' ? item.video.url.trim() : '';
+            const themeUrl = typeof item?.theme?.url === 'string' ? item.theme.url.trim() : '';
+            if (!imageUrl && !videoUrl && !themeUrl) return null;
+            const id = String(item?.id || `${gamePreset.toLowerCase()}-${index + 1}`);
+            return {
+                id,
+                type: videoUrl ? 'Video' : 'Image',
+                imageUrl: imageUrl || undefined,
+                videoUrl: videoUrl || undefined,
+                themeUrl: themeUrl || undefined,
+            } as BackgroundEntry;
+        }).filter((entry: BackgroundEntry | null): entry is BackgroundEntry => !!entry);
+    }
+
+    async function getAvailableBackgrounds(gamePreset: string): Promise<BackgroundEntry[]> {
+        const hypBackgrounds = await getHypBackgrounds(gamePreset);
+        if (hypBackgrounds.length > 0) return hypBackgrounds;
+
+        const fixed = fixedBackgroundSources[gamePreset];
+        if (!fixed) return [];
+        const entries: BackgroundEntry[] = [];
+        if (fixed.imageUrl) entries.push({ id: `${gamePreset.toLowerCase()}-image`, type: 'Image', imageUrl: fixed.imageUrl });
+        if (fixed.videoUrl) entries.push({ id: `${gamePreset.toLowerCase()}-video`, type: 'Video', imageUrl: fixed.imageUrl, videoUrl: fixed.videoUrl });
+        return entries;
+    }
+
+    async function getGameNews(gamePreset: string): Promise<GameNewsContent> {
+        const gameId = hypPresetToGameId[gamePreset];
+        if (!gameId) return { banners: [], posts: [] };
+
+        const apiUrl = `https://hyp-api.mihoyo.com/hyp/hyp-connect/api/getGameContent?launcher_id=jGHBHlcOq1&game_id=${gameId}&language=${getBackgroundApiLanguage()}`;
+        const response = await fetch(apiUrl, { method: 'GET' });
+        if (!response.ok) {
+            throw new Error(t('resourceManager.messages.requestFailed', { status: response.status }));
+        }
+
+        const json = await response.json();
+        const content = json?.data?.content;
+        const banners = Array.isArray(content?.banners)
+            ? content.banners.map((item: any, index: number) => ({
+                id: String(item?.id || `banner-${index}`),
+                imageUrl: typeof item?.image?.url === 'string' ? item.image.url.trim() : '',
+                link: typeof item?.image?.link === 'string' ? item.image.link.trim() : '',
+            })).filter((item: { imageUrl: string }): boolean => !!item.imageUrl)
+            : [];
+        const posts = Array.isArray(content?.posts)
+            ? content.posts.map((item: any, index: number) => ({
+                id: String(item?.id || `post-${index}`),
+                type: String(item?.type || 'POST_TYPE_INFO'),
+                title: typeof item?.title === 'string' ? item.title.trim() : '',
+                link: typeof item?.link === 'string' ? item.link.trim() : '',
+                date: typeof item?.date === 'string' ? item.date.trim() : '',
+            })).filter((item: GameNewsPost): boolean => !!item.title)
+            : [];
+        return { banners, posts };
+    }
+
+    function supportsAutoUpdateBackground(gamePreset: string): boolean {
+        return gamePreset.trim().toUpperCase() === 'EFMI'
+            || Object.prototype.hasOwnProperty.call(fixedBackgroundSources, gamePreset)
+            || Object.prototype.hasOwnProperty.call(hypPresetToGameId, gamePreset);
+    }
+
+    async function resolveGithubToken(githubToken?: string): Promise<string> {
+        // 未配置 token 时返回空字符串，请求不带 Authorization 头。
+        return (githubToken || '').trim();
+    }
+
+    async function fetchGithubReleases(
+        repo: string,
+        githubToken?: string,
+    ): Promise<GithubRelease[]> {
+        const url = `https://api.github.com/repos/${repo}/releases?per_page=100`;
+        const headers: Record<string, string> = {
+            "User-Agent": "ssmt4-app",
+            "Accept": "application/vnd.github.v3+json",
+        };
+
+        const effectiveToken = await resolveGithubToken(githubToken);
+
+        if (effectiveToken) {
+            headers["Authorization"] = `Bearer ${effectiveToken}`;
+        }
+
+        const resp = await fetch(url, { headers });
+        if (!resp.ok) {
+            const body = await resp.text().catch(() => "");
+            throw new Error(t('resourceManager.messages.githubApiError', { status: resp.status, body }));
+        }
+
+        const json = await resp.json();
+        return Array.isArray(json) ? json as GithubRelease[] : [];
+    }
+
+    function resolveGithubReleaseAsset(
+        assets: GithubReleaseAsset[],
+        assetMatcher?: (assetName: string) => boolean,
+    ): GithubReleaseAsset | null {
+        let asset = assets.find((candidate) => {
+            const name = candidate?.name;
+            if (typeof name !== 'string') return false;
+            if (assetMatcher) return assetMatcher(name);
+            return name.endsWith('.zip');
+        });
+
+        if (!asset && !assetMatcher) {
+            asset = assets[0];
+        }
+
+        return asset ?? null;
+    }
+
+    function mapGithubReleaseToUpdateInfo(
+        release: GithubRelease,
+        isLatest: boolean,
+        assetMatcher?: (assetName: string) => boolean,
+    ): UpdateInfo | null {
+        const tag_name = release.tag_name ?? null;
+        if (!tag_name) {
+            return null;
+        }
+
+        const assets = Array.isArray(release.assets) ? release.assets as GithubReleaseAsset[] : [];
+        if (assets.length === 0) {
+            return null;
+        }
+
+        const asset = resolveGithubReleaseAsset(assets, assetMatcher);
+        if (!asset) {
+            return null;
+        }
+
+        const download_url = asset.browser_download_url;
+        if (!download_url) {
+            return null;
+        }
+
+        return {
+            version: tag_name,
+            description: release.body ?? t('resourceManager.messages.noDescription'),
+            download_url,
+            is_latest: isLatest,
+            is_prerelease: !!release.prerelease,
+        };
+    }
+
+    async function getGithubReleaseList(
+        repo: string,
+        githubToken?: string,
+        options: GithubReleaseQueryOptions = {},
+    ): Promise<UpdateInfo[]> {
+        const releases = await fetchGithubReleases(repo, githubToken);
+        const includePrerelease = options.includePrerelease ?? false;
+        const assetMatcher = options.assetMatcher;
+
+        return releases
+            .filter((candidate) => {
+                if (!candidate || candidate.draft) {
+                    return false;
+                }
+
+                if (!includePrerelease && candidate.prerelease) {
+                    return false;
+                }
+
+                const assets = Array.isArray(candidate.assets) ? candidate.assets : [];
+                if (assets.length === 0) {
+                    return false;
+                }
+
+                return resolveGithubReleaseAsset(assets, assetMatcher) !== null;
+            })
+            .map((release, index) => mapGithubReleaseToUpdateInfo(release, index === 0, assetMatcher))
+            .filter((release): release is UpdateInfo => release !== null);
+    }
+
+    async function getLatestGithubRelease(
+        repo: string,
+        githubToken?: string,
+        includePrerelease = false,
+        assetMatcher?: (assetName: string) => boolean,
+    ): Promise<UpdateInfo> {
+        const releases = await getGithubReleaseList(repo, githubToken, {
+            includePrerelease,
+            assetMatcher,
+        });
+
+        const release = releases[0];
+        if (!release) {
+            throw new Error(t('resourceManager.messages.releaseNotFoundForCriteria'));
+        }
+
+        return release;
+    }
+
+    function buildSidebarMap(iconConfig: { GameIconSettingList?: Array<{ GameName: string; Show: boolean }>; list?: Array<{ game_name: string; show: boolean }> }): Map<string, boolean> {
+        const sidebarMap = new Map<string, boolean>();
+
+        if (iconConfig && Array.isArray(iconConfig.GameIconSettingList)) {
+            for (const it of iconConfig.GameIconSettingList) {
+                if (it && typeof it.GameName === 'string') {
+                    sidebarMap.set(it.GameName, !!it.Show);
+                }
+            }
+        } else if (iconConfig && Array.isArray(iconConfig.list)) {
+            for (const it of iconConfig.list) {
+                if (it && typeof it.game_name === 'string') {
+                    sidebarMap.set(it.game_name, !!it.show);
+                }
+            }
+        }
+
+        return sidebarMap;
+    }
+
+    async function ensureGlobalGameIconConfigExists(): Promise<string> {
+        const gamesRoot = await GlobalConfig.GlobalGamesFolder();
+        await SSMTFileUtils.CreateFolderIfNotExists(gamesRoot);
+
+        const targetConfigPath = await GlobalConfig.GlobalGameIconConfigFilePath();
+        if (await exists(targetConfigPath)) {
+            return targetConfigPath;
+        }
+
+        const sourceGamesFolder = await GlobalConfig.SSMTResourcesGamesFolder();
+        const sourceConfigPath = await join(sourceGamesFolder, 'GameIconConfig.json');
+
+        if (await exists(sourceConfigPath)) {
+            await SSMTFileUtils.CopyFileIfMissing(sourceConfigPath, targetConfigPath);
+        } else {
+            await writeTextFile(targetConfigPath, JSON.stringify({ GameIconSettingList: [] }, null, 2));
+        }
+
+        return targetConfigPath;
+    }
+
+    async function loadGameIconSidebarMap(): Promise<Map<string, boolean>> {
+        const configPath = await ensureGlobalGameIconConfigExists();
+        const iconConfig = await SSMTJsonUtils.readJson(configPath) as {
+            GameIconSettingList?: Array<{ GameName: string; Show: boolean }>;
+            list?: Array<{ game_name: string; show: boolean }>;
+        } | null;
+        return buildSidebarMap(iconConfig ?? {});
+    }
+
+    // ============================================================
+    // Public methods (returned from store)
+    // ============================================================
+
+    async function ensureGameConfigExists(gameName: string): Promise<GameConfig> {
+        return GameConfigManager.ensureConfigExists(gameName);
+    }
+
+    async function createNewConfig(gameName: string, config?: GameConfig): Promise<void> {
+        return GameConfigManager.createNewConfig(gameName, config);
+    }
+
+    async function deleteGameConfigFolder(gameName: string): Promise<void> {
+        return GameConfigManager.deleteGameConfigFolder(gameName);
+    }
+
+    async function setGameIcon(gameName: string, sourcePath: string): Promise<void> {
+        const gamesRoot = await GlobalConfig.GlobalGamesFolder();
+        const dirPath = await SSMTFileUtils.JoinPath(gamesRoot, gameName);
+        if (!(await exists(dirPath))) {
+            throw new Error(t('resourceManager.messages.gameDirectoryNotFound', { path: dirPath }));
+        }
+
+        const targetPath = await SSMTFileUtils.JoinPath(dirPath, 'Icon.png');
+        try {
+            if (await exists(targetPath)) {
+                await remove(targetPath);
+            }
+        } catch {}
+
+        await copyFile(sourcePath, targetPath);
+    }
+
+    function previousEndfieldAsset(
+        entries: Array<{ type: 'Image' | 'Video'; imagePath?: string; videoPath?: string; imageUrl?: string; videoUrl?: string }>,
+        kind: 'image' | 'video',
+    ) {
+        const expectedType = kind === 'image' ? 'Image' : 'Video';
+        return entries.find(entry =>
+            entry.type === expectedType
+            && (kind === 'image' ? entry.imageUrl && entry.imagePath : entry.videoUrl && entry.videoPath)
+        ) || entries.find(entry => kind === 'image' ? entry.imagePath : entry.videoPath);
+    }
+
+    async function updateEndfieldBackground(
+        gameName: string,
+        bgType: 'Image' | 'Video',
+    ): Promise<{ path: string; url: string; changed: boolean }> {
+        const conf = await loadGameConfig(gameName);
+        const previousEntries = Array.isArray(conf.backgroundEntries) ? conf.backgroundEntries : [];
+        const previousImage = previousEndfieldAsset(previousEntries, 'image');
+        const previousVideo = previousEndfieldAsset(previousEntries, 'video');
+        const info = await invoke<HypergryphEndfieldInfo>('sync_endfield_background', {
+            gameName,
+            previousImagePath: previousImage?.imagePath,
+            previousVideoUrl: previousVideo?.videoUrl,
+            previousVideoPath: previousVideo?.videoPath,
+        });
+        const videoPath = info.videoPath || undefined;
+
+        const imageEntry: BackgroundEntry = {
+            id: ENDFIELD_IMAGE_ENTRY_ID,
+            type: 'Image' as const,
+            imagePath: info.imagePath,
+            imageUrl: info.imageUrl,
+        };
+        const entries: BackgroundEntry[] = [
+            imageEntry,
+            ...(videoPath ? [{
+                id: ENDFIELD_VIDEO_ENTRY_ID,
+                type: 'Video' as const,
+                imagePath: info.imagePath,
+                videoPath,
+                imageUrl: info.imageUrl,
+                videoUrl: info.videoUrl || undefined,
+            }] : []),
+        ];
+        const selected = bgType === 'Video' && videoPath ? entries[1] : imageEntry;
+        conf.backgroundEntries = entries;
+        conf.selectedBackgroundId = selected.id;
+        conf.backgroundType = selected.type;
+        conf.lastBackgroundUrl = [info.imageUrl, info.videoUrl || ''].filter(Boolean).join('|');
+
+        const retainedPathKeys = new Set(
+            entries.flatMap(entry => [entry.imagePath, entry.videoPath])
+                .filter((path): path is string => Boolean(path))
+                .map(localPathKey),
+        );
+        const previousPathKeys = new Set(
+            previousEntries.flatMap(entry => [entry.imagePath, entry.videoPath])
+                .filter((path): path is string => Boolean(path))
+                .map(localPathKey),
+        );
+        try {
+            await updateGameConfig(gameName, latest => ({
+                ...latest,
+                backgroundEntries: entries,
+                selectedBackgroundId: selected.id,
+                backgroundType: selected.type,
+                lastBackgroundUrl: [info.imageUrl, info.videoUrl || ''].filter(Boolean).join('|'),
+            }));
+        } catch (error) {
+            for (const entry of entries) {
+                for (const path of [entry.imagePath, entry.videoPath]) {
+                    if (!path) continue;
+                    const fileName = path.split(/[\\/]/).pop() || '';
+                    if (previousPathKeys.has(localPathKey(path))) continue;
+                    if (!fileName.startsWith(ENDFIELD_MANAGED_BACKGROUND_PREFIX)) continue;
+                    await remove(path).catch(() => {});
+                }
+            }
+            throw error;
+        }
+
+        const gamesRoot = await GlobalConfig.GlobalGamesFolder();
+        const dirPath = await SSMTFileUtils.JoinPath(gamesRoot, gameName);
+        for (const child of await readDir(dirPath).catch(() => [])) {
+            if (child.isDirectory || !child.name?.startsWith(ENDFIELD_MANAGED_BACKGROUND_PREFIX)) continue;
+            const path = await SSMTFileUtils.JoinPath(dirPath, child.name);
+            if (!retainedPathKeys.has(localPathKey(path))) await remove(path).catch(() => {});
+        }
+
+        return {
+            path: selected.type === 'Video' ? selected.videoPath || selected.imagePath || '' : selected.imagePath || '',
+            url: selected.type === 'Video' ? selected.videoUrl || selected.imageUrl || '' : selected.imageUrl || '',
+            changed: info.changed,
+        };
+    }
+
+    async function setGameBackground(gameName: string, sourcePath: string, bgType: 'Image' | 'Video'): Promise<void> {
+        const gamesRoot = await GlobalConfig.GlobalGamesFolder();
+        const dirPath = await SSMTFileUtils.JoinPath(gamesRoot, gameName);
+        if (!(await exists(dirPath))) {
+            throw new Error(t('resourceManager.messages.gameDirectoryNotFound', { path: dirPath }));
+        }
+
+        const ext = sourcePath.split('.').pop()?.toLowerCase() || '';
+        // 新文件独立命名，不能覆盖正在解码的文件，也不能先删除仍有效的旧背景。
+        const targetName = `Background-Custom-${crypto.randomUUID()}.${ext}`;
+        const targetPath = await SSMTFileUtils.JoinPath(dirPath, targetName);
+        const id = `custom-${bgType.toLowerCase()}`;
+        await copyFile(sourcePath, targetPath);
+        let previousPath: string | undefined;
+        let savedConfig: GameConfig;
+        try {
+            savedConfig = await updateGameConfig(gameName, async latest => {
+                const entries = latest.backgroundEntries || [];
+                const previous = entries.find(entry => entry.id === id);
+                const poster = entries.find(entry => entry.type === 'Image')?.imagePath
+                    || await findExistingFileIgnoreCase(dirPath, BACKGROUND_IMAGE_CANDIDATES) || undefined;
+                previousPath = bgType === 'Video' ? previous?.videoPath : previous?.imagePath;
+                return {
+                    ...latest,
+                    backgroundType: bgType,
+                    backgroundUpdateMode: 'manual',
+                    backgroundEntries: [
+                        ...entries.filter(entry => entry.id !== id),
+                        { id, type: bgType, imagePath: bgType === 'Image' ? targetPath : poster,
+                            videoPath: bgType === 'Video' ? targetPath : undefined },
+                    ],
+                    selectedBackgroundId: id,
+                };
+            });
+        } catch (error) {
+            await remove(targetPath).catch(() => {});
+            throw error;
+        }
+        if (previousPath && previousPath !== sourcePath && !savedConfig.backgroundEntries?.some(entry =>
+            entry.imagePath === previousPath || entry.videoPath === previousPath || entry.themePath === previousPath)) {
+            const ownedPrefix = await SSMTFileUtils.JoinPath(dirPath, 'Background-Custom-');
+            if (previousPath.startsWith(ownedPrefix)) await remove(previousPath).catch(() => {});
+        }
+    }
+
+    async function updateGameBackground(gameName: string, gamePreset: string, bgType: 'Image' | 'Video', lastUrl?: string): Promise<{ path: string; url: string; changed: boolean }> {
+        const conf = await loadGameConfig(gameName);
+        const effectivePreset = (conf.gamePreset || gamePreset).trim();
+        const effectiveBgType = (conf.backgroundType || bgType) as 'Image' | 'Video';
+
+        if (effectivePreset.toUpperCase() === 'EFMI') {
+            return updateEndfieldBackground(gameName, effectiveBgType);
+        }
+        if (!supportsAutoUpdateBackground(effectivePreset)) {
+            throw new Error(t('resourceManager.messages.unsupportedPresetForAutoUpdate'));
+        }
+
+        const gamesRoot = await GlobalConfig.GlobalGamesFolder();
+        const dirPath = await SSMTFileUtils.JoinPath(gamesRoot, gameName);
+        if (!(await exists(dirPath))) {
+            await mkdir(dirPath, { recursive: true });
+        }
+
+        const previousEntries = Array.isArray(conf.backgroundEntries) ? conf.backgroundEntries : [];
+        const available = await getAvailableBackgrounds(effectivePreset);
+        if (available.length === 0) {
+            throw new Error(
+                effectiveBgType === 'Video'
+                    ? t('resourceManager.messages.noVideoBackgroundAvailable')
+                    : t('resourceManager.messages.noImageBackgroundAvailable')
+            );
+        }
+
+        const safeId = (id: string, index: number) => {
+            const safe = id.trim().replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
+            return safe || `entry-${index + 1}`;
+        };
+        const download = async (url: string, path: string): Promise<void> => {
+            let requestUrl = url;
+            const isWwmiVideo = url === fixedBackgroundSources.WWMI.videoUrl;
+            if (isWwmiVideo) {
+                const nonce = Array.from(crypto.getRandomValues(new Uint8Array(5)), byte => byte.toString(16).padStart(2, '0')).join('');
+                // 临时鉴权只用于请求，配置和缓存比较始终使用不带签名的来源 URL。
+                requestUrl = await invoke<string>('sign_wwmi_background_url', { url, nonce });
+            }
+            const response = await fetch(requestUrl, { method: 'GET', signal: AbortSignal.timeout(120_000) });
+            if (!response.ok) {
+                throw new Error(t('resourceManager.messages.downloadFailedWithStatus', { status: response.status }));
+            }
+            const bytes = new Uint8Array(await response.arrayBuffer());
+            if (!bytes.length || (isWwmiVideo && String.fromCharCode(...bytes.subarray(4, 8)) !== 'ftyp')) {
+                throw new Error('背景响应为空或不是有效的 MP4 文件');
+            }
+            const pendingPath = `${path}.download`;
+            try {
+                await writeFile(pendingPath, bytes);
+                await rename(pendingPath, path);
+            } finally {
+                if (await exists(pendingPath)) await remove(pendingPath).catch(() => {});
+            }
+        };
+
+        const entries: BackgroundEntry[] = [];
+        const managedNames = new Set<string>();
+        const savedResources = new Map<string, string | undefined>();
+        let changed = false;
+        for (let index = 0; index < available.length; index += 1) {
+            const remote = available[index];
+            const id = safeId(remote.id, index);
+            const previous = previousEntries.find(item => item?.id === remote.id || item?.id === id);
+            const entry: BackgroundEntry = { id: remote.id, type: remote.type, imageUrl: remote.imageUrl, videoUrl: remote.videoUrl, themeUrl: remote.themeUrl };
+
+            const saveResource = async (url: string | undefined, kind: 'image' | 'video' | 'theme', fallbackExt: string): Promise<string | undefined> => {
+                if (!url) return undefined;
+                if (savedResources.has(url)) return savedResources.get(url);
+                const previousPath = previous && (kind === 'image' ? previous.imagePath : kind === 'video' ? previous.videoPath : previous.themePath);
+                const previousUrl = previous && (kind === 'image' ? previous.imageUrl : kind === 'video' ? previous.videoUrl : previous.themeUrl);
+                const ext = extensionFromUrl(url, fallbackExt);
+                const prefix = kind === 'theme' ? 'BackgroundTheme' : 'Background';
+                const filename = `${prefix}-${id}${kind === 'video' ? `.${ext}` : `.${ext}`}`;
+                const targetPath = await SSMTFileUtils.JoinPath(dirPath, filename);
+                managedNames.add(filename.toLowerCase());
+                let savedPath: string | undefined = targetPath;
+                try {
+                    if (!previousPath || previousUrl !== url || !(await exists(previousPath))) {
+                        await download(url, targetPath);
+                        changed = true;
+                    } else if (previousPath !== targetPath) {
+                        await copyFile(previousPath, targetPath);
+                        changed = true;
+                    }
+                } catch (error) {
+                    if (effectivePreset !== 'WWMI') throw error;
+                    console.warn('鸣潮背景资源获取失败，保留本地背景', kind, error);
+                    savedPath = previousPath && await exists(previousPath) ? previousPath : undefined;
+                    if (!savedPath && kind === 'image') {
+                        savedPath = await findExistingFileIgnoreCase(dirPath, BACKGROUND_IMAGE_CANDIDATES) || undefined;
+                    }
+                    if (savedPath) {
+                        managedNames.add(savedPath.split(/[\\/]/).pop()!.toLowerCase());
+                        const sourceKey = kind === 'image' ? 'imageUrl' : kind === 'video' ? 'videoUrl' : 'themeUrl';
+                        // 回退资源不标记为已从新来源下载成功，下次联网仍可重试。
+                        entry[sourceKey] = savedPath === previousPath ? previousUrl : undefined;
+                    }
+                }
+                savedResources.set(url, savedPath);
+                return savedPath;
+            };
+
+            entry.imagePath = await saveResource(remote.imageUrl, 'image', 'png');
+            entry.videoPath = await saveResource(remote.videoUrl, 'video', 'mp4');
+            entry.themePath = await saveResource(remote.themeUrl, 'theme', 'webp');
+            // 下载失败的视频不能伪装成第二张静态图加入列表。
+            if (effectivePreset === 'WWMI' && remote.type === 'Video' && !entry.videoPath) continue;
+            if (entry.imagePath || entry.videoPath || entry.themePath) entries.push(entry);
+        }
+
+        if (entries.length === 0) {
+            if (effectivePreset === 'WWMI') return { path: '', url: '', changed: false };
+            throw new Error(t('resourceManager.messages.backgroundsMissingFromServer'));
+        }
+
+        let selected: BackgroundEntry | undefined;
+        await updateGameConfig(gameName, latest => {
+            selected = entries.find(entry => entry.id === latest.selectedBackgroundId && entry.type === effectiveBgType)
+                || entries.find(entry => entry.type === effectiveBgType) || entries[0];
+            return {
+                ...latest,
+                backgroundType: effectiveBgType,
+                backgroundEntries: entries,
+                lastBackgroundUrl: entries.map(entry => entry.videoUrl || entry.imageUrl || '').filter(Boolean).join('|'),
+                selectedBackgroundId: selected.id,
+            };
+        });
+
+        try {
+            const children = await readDir(dirPath);
+            for (const child of children) {
+                const name = child?.name || '';
+                const lower = name.toLowerCase();
+                if (!child.isDirectory && (lower.startsWith('background-') || lower.startsWith('backgroundtheme-')) && !managedNames.has(lower)) {
+                    await remove(await SSMTFileUtils.JoinPath(dirPath, name));
+                    changed = true;
+                }
+            }
+        } catch (err) {
+            console.warn('Failed to clean stale managed background files', err);
+        }
+
+        if (!selected) throw new Error(t('resourceManager.messages.backgroundsMissingFromServer'));
+        const path = effectiveBgType === 'Video' ? selected.videoPath || selected.imagePath : selected.imagePath || selected.videoPath;
+        const url = effectiveBgType === 'Video' ? selected.videoUrl || selected.imageUrl || '' : selected.imageUrl || selected.videoUrl || '';
+        if (!lastUrl && !changed) changed = true;
+        return { path: path || '', url, changed };
+    }
+
+    async function loadGameConfig(gameName: string): Promise<GameConfig> {
+        return GameConfigManager.loadGameConfig(gameName);
+    }
+
+    async function updateGameConfig(
+        gameName: string,
+        updater: (config: GameConfig) => GameConfig | null | undefined | Promise<GameConfig | null | undefined>,
+    ): Promise<GameConfig> {
+        return GameConfigManager.updateGameConfig(gameName, updater);
+    }
+
+    async function saveGameConfig(gameName: string, config: GameConfig): Promise<void> {
+        return GameConfigManager.saveGameConfig(gameName, config);
+    }
+
+    async function findGameBackgroundPath(gameName: string, bgType: BGType = 'Image'): Promise<string> {
+        const normalizedGameName = (gameName || '').trim();
+        if (!normalizedGameName) {
+            return '';
+        }
+
+        const gamesRoot = await GlobalConfig.GlobalGamesFolder();
+        const dirPath = await SSMTFileUtils.JoinPath(gamesRoot, normalizedGameName);
+        if (!(await exists(dirPath))) {
+            return '';
+        }
+
+        const preferredCandidates = bgType === 'Video' ? BACKGROUND_VIDEO_CANDIDATES : BACKGROUND_IMAGE_CANDIDATES;
+        const fallbackCandidates = bgType === 'Video' ? BACKGROUND_IMAGE_CANDIDATES : BACKGROUND_VIDEO_CANDIDATES;
+        const config = await loadGameConfig(normalizedGameName);
+        const selected = config.backgroundEntries?.find(entry => entry.id === config.selectedBackgroundId && entry.type === bgType);
+        const selectedPath = bgType === 'Video' ? selected?.videoPath : selected?.imagePath;
+        if (selectedPath && await exists(selectedPath)) return selectedPath;
+        return (await findExistingFileIgnoreCase(dirPath, preferredCandidates))
+            || (await findExistingFileIgnoreCase(dirPath, fallbackCandidates));
+    }
+
+    function isDx12GamePreset(gamePreset?: string | null): boolean {
+        return (gamePreset || '').trim().toUpperCase() === DX12_PRESET;
+    }
+
+    async function resolveBootDllSource(gamePreset?: string | null): Promise<{ sourcePath: string; targetFileName: string; label: string }> {
+        const resourcesDir = await GlobalConfig.SSMTResourcesFolder();
+
+        if (isDx12GamePreset(gamePreset)) {
+            return {
+                sourcePath: await join(resourcesDir, 'DX12', DX12_D3D12_FILE_NAME),
+                targetFileName: DX12_D3D12_FILE_NAME,
+                label: DX12_D3D12_FILE_NAME,
+            };
+        }
+
+        return {
+            sourcePath: await join(resourcesDir, 'd3d11.dll'),
+            targetFileName: 'd3d11.dll',
+            label: 'd3d11.dll',
+        };
+    }
+
+    async function resolveMigotoDllSource(config?: Pick<GameConfig, 'gamePreset'> | null): Promise<{ sourcePath: string; targetFileName: string; label: string }> {
+        return resolveBootDllSource(config?.gamePreset);
+    }
+
+    async function CopyGamesToGlobalConfig(includeMihoyoGames = false): Promise<string> {
+        //确保全局配置文件夹存在
+        const ssmt_global_configs_folder = await GlobalConfig.SSMT4GlobalConfigsFolder()
+        await SSMTFileUtils.CreateFolderIfNotExists(ssmt_global_configs_folder)
+        //确保全局配置文件夹下面的Games文件夹存在
+        const target_games_folder = await join(ssmt_global_configs_folder, 'Games')
+        await SSMTFileUtils.CreateFolderIfNotExists(target_games_folder)
+
+        //SSMT源文件夹
+        const ssmt_games_folder = await GlobalConfig.SSMTResourcesGamesFolder()
+        if (!(await exists(ssmt_games_folder))) {
+            return target_games_folder
+        }
+
+        const source_entries = await readDir(ssmt_games_folder)
+        for (const entry of source_entries) {
+            if (!entry?.isDirectory || !entry.name) continue
+            if (!includeMihoyoGames && isMihoyoGamePreset(entry.name)) continue
+
+            const source_game_folder = await join(ssmt_games_folder, entry.name)
+            const target_game_folder = await join(target_games_folder, entry.name)
+
+            if (!(await exists(target_game_folder))) {
+                await SSMTFileUtils.CopyDirRecursive(source_game_folder, target_game_folder)
+            }
+        }
+
+        await ensureGlobalGameIconConfigExists()
+        return target_games_folder
+    }
+
+
+    async function Copy3DmigotoDllFiles(targetDir: string, gamePreset?: string): Promise<void> {
+        const resDir = await resourceDir()
+        const candidates = [resDir, await join(resDir, 'resources')]
+        const bootDll = isDx12GamePreset(gamePreset)
+            ? { source: await join('DX12', DX12_D3D12_FILE_NAME), target: DX12_D3D12_FILE_NAME }
+            : { source: 'd3d11.dll', target: 'd3d11.dll' }
+        const BOOT_FILES = [bootDll, { source: 'd3dcompiler_47.dll', target: 'd3dcompiler_47.dll' }, { source: 'Run.exe', target: 'Run.exe' }]
+
+        for (const file of BOOT_FILES) {
+            let src: string | null = null
+            for (const base of candidates) {
+                const path = await join(base, file.source)
+                if (await exists(path)) {
+                    src = path
+                    break
+                }
+            }
+            if (!src) continue
+            const dst = await join(targetDir, file.target)
+            await SSMTFileUtils.CopyFileIfMissing(src, dst)
+        }
+    }
+
+    async function getMissingSSMTRuntimeFiles(gameName?: string): Promise<string[]> {
+        const config = gameName ? await loadGameConfig(gameName) : null;
+        const resourcesDir = await GlobalConfig.SSMTResourcesFolder();
+        const requiredFiles = isDx12GamePreset(config?.gamePreset)
+            ? [await join('DX12', DX12_D3D12_FILE_NAME)]
+            : ['d3d11.dll'];
+        const missingFiles: string[] = [];
+
+        for (const fileName of requiredFiles) {
+            const filePath = await join(resourcesDir, fileName);
+            if (!(await exists(filePath))) {
+                missingFiles.push(fileName);
+            }
+        }
+
+        return missingFiles;
+    }
+
+    async function get3DMigotoLatestRelease(
+        gamePreset: string,
+        githubToken?: string,
+        includePrerelease = false,
+    ): Promise<UpdateInfo | null> {
+        const repo = getGithubRepoByGamePreset(gamePreset);
+
+        if (!repo) return null;
+
+        const assetMatcher = gamePreset === 'IdentityV'
+            ? (name: string) => /^IdentityV-Package-.*\.zip$/i.test(name)
+            : undefined;
+        return getLatestGithubRelease(repo, githubToken, includePrerelease, assetMatcher);
+    }
+
+    async function get3DMigotoReleaseList(
+        gamePreset: string,
+        githubToken?: string,
+        includePrerelease = false,
+    ): Promise<UpdateInfo[] | null> {
+        const repo = getGithubRepoByGamePreset(gamePreset);
+
+        if (!repo) return null;
+
+        const assetMatcher = gamePreset === 'IdentityV'
+            ? (name: string) => /^IdentityV-Package-.*\.zip$/i.test(name)
+            : undefined;
+        return getGithubReleaseList(repo, githubToken, { includePrerelease, assetMatcher });
+    }
+
+    async function getAppLatestRelease(
+        githubToken?: string,
+        includePrerelease = false,
+    ): Promise<UpdateInfo> {
+        return getLatestGithubRelease(
+            'Perxenic-Acid/SSMT4',
+            githubToken,
+            includePrerelease,
+        );
+    }
+
+    async function getXXMILibsReleaseList(
+        githubToken?: string,
+        includePrerelease = false,
+        gamePreset?: string,
+    ): Promise<UpdateInfo[]> {
+        const repo = (gamePreset || '').trim().toUpperCase() === 'IDENTITYV'
+            ? 'StarBobis/ProjectBunny'
+            : 'SpectrumQT/XXMI-Libs-Package';
+        const releases = await fetchGithubReleases(repo, githubToken);
+        return releases
+            .filter(release => release?.tag_name && !release.draft && (includePrerelease || !release.prerelease))
+            .map((release, index) => ({
+                version: release.tag_name!,
+                description: release.body ?? t('resourceManager.messages.noDescription'),
+                download_url: '',
+                is_latest: index === 0,
+                is_prerelease: !!release.prerelease,
+            }));
+    }
+
+    /**
+     * 前端实现的 3Dmigoto 包更新：下载 zip 到目标目录并使用 PowerShell Expand-Archive 解压。
+     * installDir 优先；若为空，则回退到 SSMT4CustomCacheFolder()/3Dmigoto/{gameName}。
+     */
+    async function install3DMigotoUpdate(
+        gameName: string,
+        downloadUrl: string,
+        cacheDir?: string,
+        installDir?: string,
+    ): Promise<void> {
+        debugLog('3DMigotoUpdate', 'game=', gameName, 'downloadUrl=', downloadUrl, 'cacheDir=', cacheDir, 'installDirArg=', installDir);
+
+        const conf = await loadGameConfig(gameName);
+        const confInstallDir = (installDir || conf.installDir || '').trim();
+
+        let target_dir: string | undefined = confInstallDir;
+
+        if (!target_dir) {
+            target_dir = await PathHelper.GetCurrentGame3DmigotoFolderPath();
+        }
+
+        if (!target_dir) {
+            throw new Error(t('resourceManager.messages.cannotUpdateBecauseInstallDirMissing'));
+        }
+
+        debugLog('3DMigotoUpdate', 'resolved targetDir=', target_dir);
+
+        if (!(await exists(target_dir))) {
+            await mkdir(target_dir, { recursive: true });
+            debugLog('3DMigotoUpdate', 'created targetDir');
+        }
+
+        const resp = await fetch(downloadUrl, { method: 'GET' });
+        if (!resp.ok) {
+            const body = await resp.text().catch(() => '');
+            throw new Error(t('resourceManager.messages.downloadFailedWithStatusAndBody', {
+                status: resp.status,
+                body,
+            }));
+        }
+        const bytes = new Uint8Array(await resp.arrayBuffer());
+        debugLog('3DMigotoUpdate', 'downloaded bytes=', bytes.length);
+
+        const target_zip_path = await SSMTFileUtils.JoinPath(target_dir, '_3dmigoto_package.zip');
+        await writeFile(target_zip_path, bytes);
+        debugLog('3DMigotoUpdate', 'wrote zip to', target_zip_path);
+
+        debugLog('3DMigotoUpdate', 'invoking rust extract_zip_archive', { zip_path: target_zip_path, dest_dir: target_dir });
+        // 核心配置包不拥有 Runtime DLL；即使包内夹带旧 DLL，也不能绕过锁定或覆盖 SSMT 适配版。
+        await invoke('extract_zip_archive', {
+            zipPath: target_zip_path, destDir: target_dir, preserveRuntimeDlls: true,
+        });
+
+        // Cleanup zip
+        try {
+            await remove(target_zip_path);
+            debugLog('3DMigotoUpdate', 'cleaned zip');
+        } catch (e) {
+            console.warn('cleanup zip failed', e);
+        }
+    }
+
+    async function scanGames(): Promise<GameInfo[]> {
+        const gamesRoot = await GlobalConfig.GlobalGamesFolder();
+        const normalizedRoot = gamesRoot.replace(/\\/g, '/');
+        const results: GameInfo[] = [];
+
+        const sidebarMap = await loadGameIconSidebarMap();
+
+        let entries: Array<{ name?: string; isDirectory?: boolean }> = [];
+        try {
+            entries = await readDir(gamesRoot);
+        } catch (e) {
+            return results;
+        }
+
+        const gameDirectories = entries
+            .filter(entry => entry?.isDirectory && entry.name)
+            .map(entry => `${normalizedRoot}/${entry.name}`);
+
+        for (const entry of entries) {
+            if (!entry?.isDirectory) continue;
+            const name = entry.name || '';
+            if (!name) continue;
+
+            const basePath = `${normalizedRoot}/${name}`;
+
+            let iconPath = '';
+            let bgPath = '';
+            let bgVideoPath: string | null = null;
+            const bgImages: string[] = [];
+            const bgVideos: string[] = [];
+            const backgroundEntries: BackgroundEntry[] = [];
+
+            const imgCandidates = BACKGROUND_IMAGE_CANDIDATES;
+            const videoCandidates = BACKGROUND_VIDEO_CANDIDATES;
+
+            let children = [] as Array<{ name?: string; isDirectory?: boolean }>;
+            try {
+                children = await readDir(basePath);
+            } catch (e) {
+                children = [];
+            }
+
+            const nameMap = new Map<string, string>();
+            children.forEach(c => {
+                const n = c.name;
+                if (n) nameMap.set(n.toLowerCase(), n);
+            });
+            debugLog('ScanGames', `Checking ${name} (path: ${basePath}). Found files:`, Array.from(nameMap.values()));
+
+            if (nameMap.has('icon.png')) {
+                iconPath = `${basePath}/${nameMap.get('icon.png')}`;
+            }
+
+            for (const candidate of imgCandidates) {
+                const matched = nameMap.get(candidate.toLowerCase());
+                if (matched) bgImages.push(`${basePath}/${matched}`);
+            }
+            for (const candidate of videoCandidates) {
+                const matched = nameMap.get(candidate.toLowerCase());
+                if (matched) bgVideos.push(`${basePath}/${matched}`);
+            }
+
+            let bgType: BGType = 'Image';
+            const configPath = `${basePath}/Config.json`;
+            const cfg = await SSMTJsonUtils.readJson(configPath) as Record<string, unknown> | null;
+            if (cfg && Array.isArray(cfg.backgroundEntries)) {
+                for (const raw of cfg.backgroundEntries) {
+                    if (!raw || typeof raw !== 'object') continue;
+                    const candidate = raw as BackgroundEntry;
+                    const imagePath = typeof candidate.imagePath === 'string' && candidate.imagePath
+                        && isAllowedBackgroundPath(candidate.imagePath, basePath, gameDirectories)
+                        ? candidate.imagePath : undefined;
+                    const videoPath = typeof candidate.videoPath === 'string' && candidate.videoPath
+                        && isAllowedBackgroundPath(candidate.videoPath, basePath, gameDirectories)
+                        ? candidate.videoPath : undefined;
+                    const themePath = typeof candidate.themePath === 'string' && candidate.themePath
+                        && isAllowedBackgroundPath(candidate.themePath, basePath, gameDirectories)
+                        ? candidate.themePath : undefined;
+                    const hasImage = !!imagePath && await exists(imagePath);
+                    const hasVideo = !!videoPath && await exists(videoPath);
+                    if (!hasImage && !hasVideo) continue;
+                    backgroundEntries.push({
+                        id: String(candidate.id || backgroundEntries.length + 1),
+                        type: candidate.type === 'Video' && hasVideo ? 'Video' : 'Image',
+                        imagePath: hasImage ? imagePath : undefined,
+                        videoPath: hasVideo ? videoPath : undefined,
+                        themePath: themePath && await exists(themePath) ? themePath : undefined,
+                        imageUrl: typeof candidate.imageUrl === 'string' ? candidate.imageUrl : undefined,
+                        videoUrl: typeof candidate.videoUrl === 'string' ? candidate.videoUrl : undefined,
+                        themeUrl: typeof candidate.themeUrl === 'string' ? candidate.themeUrl : undefined,
+                    });
+                    if (hasImage) bgImages.push(imagePath!);
+                    if (hasVideo) bgVideos.push(videoPath!);
+                }
+            }
+            if (cfg && cfg.backgroundType) {
+                const v = String(cfg.backgroundType);
+                bgType = v.toLowerCase() === 'video' ? 'Video' : 'Image';
+            } else if (cfg && cfg.background_type) {
+                const v = String(cfg.background_type);
+                bgType = v.toLowerCase() === 'video' ? 'Video' : 'Image';
+            }
+
+            const preferredEntry = backgroundEntries.find(entry => entry.type === bgType) || backgroundEntries[0];
+            if (preferredEntry) {
+                if (preferredEntry.imagePath) bgPath = preferredEntry.imagePath;
+                if (preferredEntry.videoPath) bgVideoPath = preferredEntry.videoPath;
+            }
+
+            if (bgType === 'Video') {
+                for (const c of videoCandidates) {
+                    if (nameMap.has(c.toLowerCase())) {
+                        bgVideoPath = `${basePath}/${nameMap.get(c.toLowerCase())}`;
+                        break;
+                    }
+                }
+                if (!bgVideoPath) {
+                    for (const c of imgCandidates) {
+                        if (nameMap.has(c.toLowerCase())) {
+                            bgPath = `${basePath}/${nameMap.get(c.toLowerCase())}`;
+                            bgType = 'Image';
+                            break;
+                        }
+                    }
+                }
+            } else {
+                for (const c of imgCandidates) {
+                    if (nameMap.has(c.toLowerCase())) {
+                        bgPath = `${basePath}/${nameMap.get(c.toLowerCase())}`;
+                        break;
+                    }
+                }
+                if (!bgPath) {
+                    for (const c of videoCandidates) {
+                        if (nameMap.has(c.toLowerCase())) {
+                            bgVideoPath = `${basePath}/${nameMap.get(c.toLowerCase())}`;
+                            bgType = 'Video';
+                            break;
+                        }
+                    }
+                }
+            }
+
+            debugLog('ScanGames', `${name} -> icon: ${iconPath}, bg: ${bgPath}, video: ${bgVideoPath}, type: ${bgType}`);
+
+            const show_sidebar = sidebarMap.get(name) ?? false;
+
+            results.push({
+                name,
+                icon_path: iconPath,
+                bg_path: bgPath,
+                bg_video_path: bgVideoPath,
+                bg_theme_path: preferredEntry?.themePath || await findExistingFileIgnoreCase(basePath, BACKGROUND_THEME_CANDIDATES),
+                bg_images: bgImages,
+                bg_videos: bgVideos,
+                background_entries: backgroundEntries,
+                selected_background_id: typeof cfg?.selectedBackgroundId === 'string' ? cfg.selectedBackgroundId : undefined,
+                bg_type: bgType,
+                show_sidebar,
+            });
+        }
+
+        return results;
+    }
+
+    async function setGameVisibility(gameName: string, visible: boolean): Promise<void> {
+        const configPath = await ensureGlobalGameIconConfigExists();
+
+        const config = await SSMTJsonUtils.readJsonOrDefault<{ GameIconSettingList?: Array<{ GameName: string; Show: boolean }>; list?: Array<{ game_name: string; show: boolean }> }>(configPath, { GameIconSettingList: [] });
+        if (!config.GameIconSettingList) {
+            if (config.list) {
+                config.GameIconSettingList = config.list.map((it) => ({ GameName: it.game_name, Show: it.show }));
+            } else {
+                config.GameIconSettingList = [];
+            }
+        }
+
+        const list = config.GameIconSettingList as Array<{ GameName: string; Show: boolean }>;
+        const existing = list.find(x => x.GameName === gameName);
+
+        if (existing) {
+            existing.Show = visible;
+        } else {
+            list.push({ GameName: gameName, Show: visible });
+        }
+
+        await writeTextFile(configPath, JSON.stringify(config, null, 2));
+    }
+
+    function extensionFromUrl(url: string, fallback: string): string {
+        try {
+            const clean = url.split('?')[0].split('#')[0];
+            const segments = clean.split('.');
+            const ext = segments.pop();
+            if (ext && ext.length <= 5) {
+                return ext.toLowerCase();
+            }
+        } catch (e) {
+            console.warn('Failed to parse extension from url', url, e);
+        }
+        return fallback;
+    }
+
+    // ============================================================
+    // Return all public methods
+    // ============================================================
+    return {
+        // Game config CRUD
+        ensureGameConfigExists,
+        createNewConfig,
+        deleteGameConfigFolder,
+        loadGameConfig,
+        updateGameConfig,
+        saveGameConfig,
+        // Game icon / background
+        setGameIcon,
+        setGameBackground,
+        updateGameBackground,
+        getGameNews,
+        findGameBackgroundPath,
+        // SSMT Runtime
+        resolveBootDllSource,
+        resolveMigotoDllSource,
+        // Global config
+        CopyGamesToGlobalConfig,
+        Copy3DmigotoDllFiles,
+        getMissingSSMTRuntimeFiles,
+        // Release fetchers
+        get3DMigotoLatestRelease,
+        get3DMigotoReleaseList,
+        getAppLatestRelease,
+        getXXMILibsReleaseList,
+        // Install
+        install3DMigotoUpdate,
+        // Scan / visibility
+        scanGames,
+        setGameVisibility,
+        // Utility
+        extensionFromUrl,
+    };
+});
+
+/**
+ * Backward-compatible wrapper that delegates every public method and
+ * property to the Pinia store instance, so existing callers using
+ * `ResourceManager.methodName()` continue to work unchanged.
+ */
+export const ResourceManager = new Proxy({} as Record<string, unknown>, {
+    get(_target, prop: string) {
+        const store = useResourceManagerStore();
+        const value = (store as unknown as Record<string, unknown>)[prop];
+        if (typeof value === 'function') {
+            return (...args: unknown[]) => value.apply(store, args);
+        }
+        return value;
+    },
+}) as {
+    ensureGameConfigExists: (gameName: string) => Promise<GameConfig>;
+    createNewConfig: (gameName: string, config?: GameConfig) => Promise<void>;
+    deleteGameConfigFolder: (gameName: string) => Promise<void>;
+    loadGameConfig: (gameName: string) => Promise<GameConfig>;
+    updateGameConfig: (gameName: string, updater: (config: GameConfig) => GameConfig | null | undefined | Promise<GameConfig | null | undefined>) => Promise<GameConfig>;
+    saveGameConfig: (gameName: string, config: GameConfig) => Promise<void>;
+    setGameIcon: (gameName: string, sourcePath: string) => Promise<void>;
+    setGameBackground: (gameName: string, sourcePath: string, bgType: 'Image' | 'Video') => Promise<void>;
+    updateGameBackground: (gameName: string, gamePreset: string, bgType: 'Image' | 'Video', lastUrl?: string) => Promise<{ path: string; url: string; changed: boolean }>;
+    getGameNews: (gamePreset: string) => Promise<GameNewsContent>;
+    findGameBackgroundPath: (gameName: string, bgType?: BGType) => Promise<string>;
+    CopyGamesToGlobalConfig: (includeMihoyoGames?: boolean) => Promise<string>;
+    resolveBootDllSource: (gamePreset?: string | null) => Promise<{ sourcePath: string; targetFileName: string; label: string }>;
+    resolveMigotoDllSource: (config?: Pick<GameConfig, 'gamePreset'> | null) => Promise<{ sourcePath: string; targetFileName: string; label: string }>;
+    Copy3DmigotoDllFiles: (targetDir: string, gamePreset?: string) => Promise<void>;
+    getMissingSSMTRuntimeFiles: (gameName?: string) => Promise<string[]>;
+    get3DMigotoLatestRelease: (gamePreset: string, githubToken?: string, includePrerelease?: boolean) => Promise<UpdateInfo | null>;
+    get3DMigotoReleaseList: (gamePreset: string, githubToken?: string, includePrerelease?: boolean) => Promise<UpdateInfo[] | null>;
+    getAppLatestRelease: (githubToken?: string, includePrerelease?: boolean) => Promise<UpdateInfo>;
+    getXXMILibsReleaseList: (githubToken?: string, includePrerelease?: boolean, gamePreset?: string) => Promise<UpdateInfo[]>;
+    install3DMigotoUpdate: (gameName: string, downloadUrl: string, cacheDir?: string, installDir?: string) => Promise<void>;
+    scanGames: () => Promise<GameInfo[]>;
+    setGameVisibility: (gameName: string, visible: boolean) => Promise<void>;
+    extensionFromUrl: (url: string, fallback: string) => string;
+};

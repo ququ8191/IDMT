@@ -1,0 +1,26 @@
+// Prevents additional console window on Windows in release, DO NOT REMOVE!!
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+mod native_texture_encoder;
+
+fn main() {
+    let mut args = std::env::args_os();
+    let mode = args.nth(1);
+    if mode.as_deref() == Some(std::ffi::OsStr::new("--ssmt-launch-console")) {
+        if let (Some(port), Some(token)) = (args.next(), args.next()) {
+            if let Ok(port) = port.to_string_lossy().parse::<u16>() {
+                let result = ssmt4_lib::commands::launch_console::console_helper(
+                    port,
+                    &token.to_string_lossy(),
+                );
+                if let Err(error) = result {
+                    eprintln!("[LaunchConsole] {error}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+        }
+        std::process::exit(2);
+    }
+    ssmt4_lib::run()
+}
