@@ -304,8 +304,8 @@
     "hidePage": "隐藏此页面",
     "enableCompactView": "启用紧凑视图",
     "disableCompactView": "关闭紧凑视图",
-    "pinWindow": "点击开启窗口置顶 · Alt + Shift + F 快速唤起 SSMT",
-    "unpinWindow": "点击取消窗口置顶 · Alt + Shift + F 快速唤起 SSMT",
+    "pinWindow": "点击开启窗口置顶 · Alt + Shift + F 快速唤起 IDMT",
+    "unpinWindow": "点击取消窗口置顶 · Alt + Shift + F 快速唤起 IDMT",
     "nav": {
       "home": "主页",
       "work": "工作台",
@@ -656,7 +656,7 @@
     "skip": "跳过",
     "choose": "选择",
     "fields": {
-      "cacheDir": "SSMT 缓存目录",
+      "cacheDir": "IDMT 缓存目录",
       "altF": "启用 Alt+Shift+F 快捷唤起",
       "textureMarkStyle": "贴图标记风格偏好",
       "previewLighting": "3D 预览简易渲染模式",
@@ -688,7 +688,7 @@
     "selectedCount": "已选 {count} 个游戏",
     "selectedMoveFront": "已选游戏自动排在最前",
     "confirm": "完成配置",
-    "cacheRequiredTitle": "必须先设置 SSMT 缓存目录",
+    "cacheRequiredTitle": "必须先设置 IDMT 缓存目录",
     "cacheRequiredMessage": "IDMT 需要独立的缓存目录来保存工作区、生成文件与本地缓存数据。请勿选择 SSMT 使用的目录。完成选择与确认之前，程序将保持锁定。",
     "cacheRequired": "选择缓存目录存放位置（必选）",
     "cacheDefaultLabel": "默认位置（程序安装目录内）",
@@ -786,7 +786,7 @@
       "cacheFolderPlaceholder": "请选择缓存目录路径",
       "changeFolder": "更改目录",
       "openFolder": "打开目录",
-      "selectCacheFolderTitle": "选择 SSMT 缓存目录"
+      "selectCacheFolderTitle": "选择 IDMT 缓存目录"
     },
     "personalization": {
       "homeLauncherContent": "启动器式主页内容",
@@ -794,7 +794,7 @@
       "homeGameNews": "显示游戏资讯栏",
       "homeGameNewsHint": "显示当前游戏启动器提供的活动、公告和资讯内容。",
       "uiMode": "界面布局",
-      "uiModeHint": "在新版侧栏界面和 SSMT 4.2.2 正式版界面之间切换。",
+      "uiModeHint": "在新版侧栏界面和经典界面之间切换。",
       "uiModes": { "modern": "新版 UI", "classic": "正式版 UI" },
       "textureMarkStyle": "贴图标记风格偏好",
       "uiScale": "全局组件尺寸",
@@ -811,11 +811,11 @@
       }
     },
     "about": {
-      "discord": "SSMT Discord 服务器",
+      "discord": "IDMT 问题反馈",
       "sponsor": "赞助",
       "afdian": "爱发电: NicoMico",
       "releasePage": "打开发布页",
-      "usageDocs": "SSMT使用文档"
+      "usageDocs": "IDMT 使用说明"
     },
     "actions": {
       "checkAppUpdate": "检查应用更新",

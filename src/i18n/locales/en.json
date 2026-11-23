@@ -305,7 +305,7 @@
     "hidePage": "Hide this page",
     "enableCompactView": "Enable compact view",
     "disableCompactView": "Disable compact view",
-    "pinWindow": "Click to pin window · Alt + Shift + F to show SSMT",
+    "pinWindow": "Click to pin window · Alt + Shift + F to show IDMT",
     "unpinWindow": "Click to unpin window · Alt + Shift + F to show SSMT",
     "nav": {
       "home": "Home",
@@ -812,11 +812,11 @@
       }
     },
     "about": {
-      "discord": "SSMT Discord Server",
+      "discord": "IDMT Issue Tracker",
       "sponsor": "Sponsor",
       "afdian": "Afdian: NicoMico",
       "releasePage": "Open Release Page",
-      "usageDocs": "SSMT Usage Docs"
+      "usageDocs": "IDMT Usage Guide"
     },
     "actions": {
       "checkAppUpdate": "Check App Updates",

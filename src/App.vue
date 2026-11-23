@@ -78,7 +78,7 @@ void GlobalConfig.SSMT4DefaultCacheFolder().then((path) => {
 });
 watch(() => AppStateManager.gamesList.map(game => game.name).join('\n'), async () => {
   if (firstRunGamesInitialized.value || AppStateManager.gamesList.length === 0) return;
-  const defaults = new Set(['GIMI', 'SRMI', 'ZZMI', 'WWMI']);
+  const defaults = new Set(['IDENTITYV', 'GIMI', 'SRMI', 'ZZMI', 'WWMI']);
   const selected: string[] = [];
   for (const game of AppStateManager.gamesList) {
     // Built-in presets are the onboarding defaults. Custom games are only

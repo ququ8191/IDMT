@@ -192,7 +192,7 @@ onMounted(async () => {
 });
 
 const openReleasePage = async () => {
-  await openUrl('https://github.com/Perxenic-Acid/SSMT4/releases');
+  await openUrl('https://github.com/ququ8191/IDMT/releases');
 };
 
 const handleCheckAndInstallAppUpdate = async () => {
@@ -200,7 +200,7 @@ const handleCheckAndInstallAppUpdate = async () => {
 };
 
 const openUsageDocs = async () => {
-  await openUrl('https://perxenic-acid.github.io/SSMT4-Documents/');
+  await openUrl('https://github.com/ququ8191/IDMT#readme');
 };
 
 /* ═══════════════════════ Games management ═══════════════════════ */
@@ -820,7 +820,7 @@ const confirmCreateGame = async () => {
                 </div>
                 <div class="about-section">
                   <h3>{{ t('settings.sections.community') }}</h3>
-                  <button type="button" class="link-row" @click="openUrl('https://discord.gg/cnVx8cF2wd')">
+                  <button type="button" class="link-row" @click="openUrl('https://github.com/ququ8191/IDMT/issues')">
                     <el-icon><ChatDotRound /></el-icon>
                     <span>{{ t('settings.about.discord') }}</span>
                     <el-icon class="link-arrow"><ArrowRight /></el-icon>
